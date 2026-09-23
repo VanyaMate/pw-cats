@@ -1,0 +1,15 @@
+{
+  "name": "pw-cats",
+  "version": "1.0.0",
+  "description": "Управление и мониторинг котов Perfect World (данные comeback.pw)",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js"
+  },
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0",
+    "express": "^4.19.2",
+    "https-proxy-agent": "^7.0.5"
+  }
+}

@@ -1,0 +1,5059 @@
+'use strict';
+
+const express = require('express');
+const axios = require('axios');
+const cheerio = require('cheerio');
+const { HttpsProxyAgent } = require('https-proxy-agent');
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const app = express();
+
+const PORT = 3030;
+const DB_FILE = path.join(__dirname, 'pw-cats.json');
+
+const PROXY_URL = 'socks5://127.0.0.1:3066';
+
+const proxyAgent = new HttpsProxyAgent(PROXY_URL);
+
+const axiosOptions = {
+    httpAgent: proxyAgent,
+    httpsAgent: proxyAgent,
+    proxy: false,
+    timeout: 30000,
+
+    headers: {
+        'User-Agent':
+            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+
+        'Accept-Language':
+            'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
+    }
+};
+
+/*
+|--------------------------------------------------------------------------
+| HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function createId() {
+    return crypto.randomUUID();
+}
+
+function now() {
+    return new Date().toISOString();
+}
+
+function toNumber(value, fallback = 0) {
+    const number = Number(value);
+
+    if (!Number.isFinite(number)) {
+        return fallback;
+    }
+
+    return number;
+}
+
+function toInt(value, fallback = 0) {
+    return Math.floor(
+        toNumber(value, fallback)
+    );
+}
+
+function sleep(ms) {
+    return new Promise(resolve => {
+        setTimeout(resolve, ms);
+    });
+}
+
+function normalizeUrl(value) {
+    let url = String(value || '').trim();
+
+    if (!url) {
+        return '';
+    }
+
+    if (!/^https?:\/\//i.test(url)) {
+        url = 'https://' + url;
+    }
+
+    return url;
+}
+
+function cleanText(value) {
+    return String(value || '')
+        .replace(/\s+/g, ' ')
+        .trim();
+}
+
+function parsePrice(value) {
+    if (value === undefined || value === null) {
+        return 0;
+    }
+
+    const text = String(value)
+        .replace(/\s/g, '')
+        .replace(',', '.')
+        .replace(/[^0-9.-]/g, '');
+
+    const result = Number(text);
+
+    return Number.isFinite(result)
+        ? result
+        : 0;
+}
+
+function parseCount(value) {
+    return Math.max(
+        0,
+        Math.floor(
+            parsePrice(value)
+        )
+    );
+}
+
+function absoluteUrl(url, baseUrl) {
+    try {
+        return new URL(
+            url,
+            baseUrl
+        ).toString();
+    } catch {
+        return url || '';
+    }
+}
+
+/*
+|--------------------------------------------------------------------------
+| DATABASE
+|--------------------------------------------------------------------------
+*/
+
+function createEmptyDatabase() {
+    return {
+        version: 1,
+
+        settings: {
+            updateIntervalMs: 7000,
+            goldPrice: 0
+        },
+
+        products: [],
+
+        cats: [],
+
+        history: []
+    };
+}
+
+function loadDatabase() {
+    if (!fs.existsSync(DB_FILE)) {
+        return createEmptyDatabase();
+    }
+
+    try {
+        const data = JSON.parse(
+            fs.readFileSync(
+                DB_FILE,
+                'utf8'
+            )
+        );
+
+        const empty =
+            createEmptyDatabase();
+
+        return {
+            ...empty,
+
+            ...data,
+
+            settings: {
+                ...empty.settings,
+                ...(data.settings || {})
+            },
+
+            products:
+                Array.isArray(data.products)
+                    ? data.products
+                    : [],
+
+            cats:
+                Array.isArray(data.cats)
+                    ? data.cats
+                    : [],
+
+            history:
+                Array.isArray(data.history)
+                    ? data.history
+                    : []
+        };
+    } catch (error) {
+        console.error(
+            'Ошибка чтения базы:',
+            error.message
+        );
+
+        return createEmptyDatabase();
+    }
+}
+
+let database = loadDatabase();
+
+function saveDatabase() {
+    const temporaryFile =
+        DB_FILE + '.tmp';
+
+    fs.writeFileSync(
+        temporaryFile,
+        JSON.stringify(
+            database,
+            null,
+            2
+        ),
+        'utf8'
+    );
+
+    fs.renameSync(
+        temporaryFile,
+        DB_FILE
+    );
+}
+
+/*
+|--------------------------------------------------------------------------
+| URL HELPERS
+|--------------------------------------------------------------------------
+*/
+
+function getCatIdFromUrl(url) {
+    try {
+        const parsed =
+            new URL(
+                normalizeUrl(url)
+            );
+
+        const match =
+            parsed.pathname.match(
+                /\/cats\/(\d+)/i
+            );
+
+        return match
+            ? match[1]
+            : '';
+    } catch {
+        return '';
+    }
+}
+
+function getQueryParameter(
+    url,
+    parameter
+) {
+    try {
+        const parsed =
+            new URL(
+                normalizeUrl(url)
+            );
+
+        return (
+            parsed.searchParams.get(
+                parameter
+            ) || ''
+        );
+    } catch {
+        return '';
+    }
+}
+
+function buildShopUrl(
+    baseUrl,
+    show,
+    page
+) {
+    const url =
+        new URL(
+            normalizeUrl(baseUrl)
+        );
+
+    /*
+     * item_id удаляем.
+     * Нам нужен весь магазин.
+     */
+
+    url.searchParams.delete(
+        'item_id'
+    );
+
+    url.searchParams.set(
+        'show',
+        show
+    );
+
+    url.searchParams.set(
+        'page',
+        String(page)
+    );
+
+    return url.toString();
+}
+
+/*
+|--------------------------------------------------------------------------
+| PARSER
+|--------------------------------------------------------------------------
+*/
+
+function parseShopPage(
+    html,
+    pageUrl
+) {
+    const $ =
+        cheerio.load(html);
+
+    const items = [];
+
+    /*
+     * Основной источник товаров:
+     *
+     * <img class="item_shop"
+     *      data-name="..."
+     *      data-price="..."
+     *      data-count="..."
+     *      data-id="..."
+     *      src="...">
+     */
+
+    $('img.item_shop[data-id]')
+        .each(
+            (_, element) => {
+                const node =
+                    $(element);
+
+                const externalId =
+                    cleanText(
+                        node.attr(
+                            'data-id'
+                        )
+                    );
+
+                if (!externalId) {
+                    return;
+                }
+
+                items.push({
+                    externalId,
+
+                    name:
+                        cleanText(
+                            node.attr(
+                                'data-name'
+                            )
+                        ) ||
+                        `Товар ${externalId}`,
+
+                    count:
+                        parseCount(
+                            node.attr(
+                                'data-count'
+                            )
+                        ),
+
+                    price:
+                        parsePrice(
+                            node.attr(
+                                'data-price'
+                            )
+                        ),
+
+                    image:
+                        absoluteUrl(
+                            node.attr(
+                                'src'
+                            ) || '',
+                            pageUrl
+                        ),
+
+                    description:
+                        node.attr(
+                            'data-desc'
+                        ) || ''
+                });
+            }
+        );
+
+    /*
+     * Убираем дубликаты.
+     */
+
+    const unique =
+        new Map();
+
+    for (
+        const item
+        of items
+    ) {
+        unique.set(
+            item.externalId,
+            item
+        );
+    }
+
+    /*
+     * Дополнительная информация
+     * о коте/магазине.
+     */
+
+    const bodyText =
+        cleanText(
+            $('body').text()
+        );
+
+    const title =
+        cleanText(
+            $('title')
+                .first()
+                .text()
+        );
+
+    const meta = {
+        title,
+
+        catName: '',
+
+        shopName: '',
+
+        location: '',
+
+        x: null,
+
+        y: null
+    };
+
+    /*
+     * Попытки найти имя кота.
+     */
+
+    const catNameSelectors = [
+        '[data-cat-name]',
+        '[data-character-name]',
+        '.cat_name',
+        '.cat-name',
+        '.character_name',
+        '.character-name'
+    ];
+
+    for (
+        const selector
+        of catNameSelectors
+    ) {
+        const element =
+            $(selector)
+                .first();
+
+        if (!element.length) {
+            continue;
+        }
+
+        meta.catName =
+            cleanText(
+                element.attr(
+                    'data-cat-name'
+                ) ||
+                element.attr(
+                    'data-character-name'
+                ) ||
+                element.text()
+            );
+
+        if (meta.catName) {
+            break;
+        }
+    }
+
+    /*
+     * Магазин.
+     */
+
+    const shopSelectors = [
+        '[data-shop-name]',
+        '.shop_name',
+        '.shop-name',
+        '.shop_title',
+        '.shop-title',
+        '.npc_name',
+        '.seller_name'
+    ];
+
+    for (
+        const selector
+        of shopSelectors
+    ) {
+        const element =
+            $(selector)
+                .first();
+
+        if (!element.length) {
+            continue;
+        }
+
+        meta.shopName =
+            cleanText(
+                element.attr(
+                    'data-shop-name'
+                ) ||
+                element.text()
+            );
+
+        if (meta.shopName) {
+            break;
+        }
+    }
+
+    /*
+     * Локация.
+     */
+
+    const locationSelectors = [
+        '[data-location]',
+        '.location',
+        '.shop_location',
+        '.shop-location',
+        '.coords',
+        '.coordinates'
+    ];
+
+    for (
+        const selector
+        of locationSelectors
+    ) {
+        const element =
+            $(selector)
+                .first();
+
+        if (!element.length) {
+            continue;
+        }
+
+        meta.location =
+            cleanText(
+                element.attr(
+                    'data-location'
+                ) ||
+                element.text()
+            );
+
+        if (meta.location) {
+            break;
+        }
+    }
+
+    /*
+     * Координаты.
+     *
+     * Это намеренно несколько мягких вариантов,
+     * поскольку точный HTML блока координат
+     * пока неизвестен.
+     */
+
+    const coordinates =
+        bodyText.match(
+            /X\s*[:=]\s*(-?\d+(?:[.,]\d+)?)\D+Y\s*[:=]\s*(-?\d+(?:[.,]\d+)?)/i
+        );
+
+    if (coordinates) {
+        meta.x =
+            Number(
+                coordinates[1]
+                    .replace(',', '.')
+            );
+
+        meta.y =
+            Number(
+                coordinates[2]
+                    .replace(',', '.')
+            );
+    }
+
+    return {
+        items:
+            Array.from(
+                unique.values()
+            ),
+
+        meta
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| REQUESTS
+|--------------------------------------------------------------------------
+*/
+
+async function fetchHtml(url) {
+    const response =
+        await axios.get(
+            url,
+            axiosOptions
+        );
+
+    return String(
+        response.data || ''
+    );
+}
+
+async function fetchShop(
+    baseUrl,
+    show
+) {
+    const allItems =
+        new Map();
+
+    let meta = {};
+
+    /*
+     * Максимум 50 страниц.
+     * Если страница пустая — останавливаемся.
+     */
+
+    for (
+        let page = 1;
+        page <= 50;
+        page++
+    ) {
+        const url =
+            buildShopUrl(
+                baseUrl,
+                show,
+                page
+            );
+
+        const html =
+            await fetchHtml(url);
+
+        const parsed =
+            parseShopPage(
+                html,
+                url
+            );
+
+        if (page === 1) {
+            meta = parsed.meta;
+        }
+
+        if (
+            parsed.items.length === 0
+        ) {
+            break;
+        }
+
+        let newItems = 0;
+
+        for (
+            const item
+            of parsed.items
+        ) {
+            if (
+                !allItems.has(
+                    item.externalId
+                )
+            ) {
+                newItems++;
+            }
+
+            allItems.set(
+                item.externalId,
+                item
+            );
+        }
+
+        /*
+         * Если новая страница полностью
+         * состоит из уже известных товаров,
+         * прекращаем обход.
+         */
+
+        if (
+            page > 1 &&
+            newItems === 0
+        ) {
+            break;
+        }
+
+        /*
+         * Для обычного магазина 20 элементов
+         * означает полную страницу.
+         *
+         * Если меньше 20 — вероятнее всего
+         * это последняя страница.
+         */
+
+        if (
+            parsed.items.length < 20
+        ) {
+            break;
+        }
+    }
+
+    return {
+        items:
+            Array.from(
+                allItems.values()
+            ),
+
+        meta
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| PRODUCTS
+|--------------------------------------------------------------------------
+*/
+
+function findProduct(
+    externalId
+) {
+    return database.products.find(
+        product =>
+            String(
+                product.externalId
+            ) ===
+            String(externalId)
+    );
+}
+
+function getOrCreateProduct(
+    parsedItem
+) {
+    let product =
+        findProduct(
+            parsedItem.externalId
+        );
+
+    if (!product) {
+        product = {
+            id: createId(),
+
+            externalId:
+                String(
+                    parsedItem.externalId
+                ),
+
+            name:
+                parsedItem.name,
+
+            image:
+                parsedItem.image,
+
+            description:
+                parsedItem.description,
+
+            /*
+             * false = товар автоматически
+             * добавлен, но ещё не настроен.
+             */
+
+            configured: false,
+
+            /*
+             * Ручные цены.
+             */
+
+            buyPrice: 0,
+
+            sellPrice: 0,
+
+            /*
+             * Цена товара через gold shop.
+             */
+
+            goldShopPrice: 0,
+
+            /*
+             * Можно задать отдельно
+             * для конкретного товара.
+             *
+             * Если 0 — используется
+             * глобальная цена gold.
+             */
+
+            goldPrice: 0,
+
+            /*
+             * Последние цены из парсера.
+             */
+
+            lastSellPrice: 0,
+
+            lastBuyPrice: 0,
+
+            createdAt: now(),
+
+            updatedAt: now()
+        };
+
+        database.products.push(
+            product
+        );
+    } else {
+        if (parsedItem.name) {
+            product.name =
+                parsedItem.name;
+        }
+
+        if (parsedItem.image) {
+            product.image =
+                parsedItem.image;
+        }
+
+        if (
+            parsedItem.description
+        ) {
+            product.description =
+                parsedItem.description;
+        }
+
+        product.updatedAt =
+            now();
+    }
+
+    return product;
+}
+
+/*
+|--------------------------------------------------------------------------
+| CAT ITEMS
+|--------------------------------------------------------------------------
+*/
+
+function getCatItem(
+    cat,
+    productId
+) {
+    return cat.items.find(
+        item =>
+            item.productId ===
+            productId
+    );
+}
+
+function getOrCreateCatItem(
+    cat,
+    product
+) {
+    let item =
+        getCatItem(
+            cat,
+            product.id
+        );
+
+    if (!item) {
+        item = {
+            productId:
+                product.id,
+
+            /*
+             * Сколько должно находиться
+             * в продаже.
+             */
+
+            sellTarget: 0,
+
+            /*
+             * Сколько должно быть
+             * на покупке/скупке.
+             */
+
+            buyTarget: 0,
+
+            /*
+             * Текущее количество
+             * с парсера.
+             */
+
+            sellCurrent: 0,
+
+            buyCurrent: 0,
+
+            /*
+             * Последняя цена
+             * конкретного кота.
+             */
+
+            sellPrice: 0,
+
+            buyPrice: 0,
+
+            lastSellUpdate: null,
+
+            lastBuyUpdate: null
+        };
+
+        cat.items.push(
+            item
+        );
+    }
+
+    return item;
+}
+
+/*
+|--------------------------------------------------------------------------
+| RECOMMENDED PRICE
+|--------------------------------------------------------------------------
+*/
+
+function getRecommendedPrice(
+    product,
+    side
+) {
+    /*
+     * Продажа:
+     *
+     * 1. вручную указанная цена продажи
+     * 2. цена из gold shop * курс gold
+     * 3. последняя цена из парсера
+     *
+     * Покупка:
+     *
+     * 1. вручную указанная цена скупки
+     * 2. цена из gold shop * курс gold
+     * 3. последняя цена из парсера
+     */
+
+    if (side === 'sell') {
+        if (
+            toNumber(
+                product.sellPrice
+            ) > 0
+        ) {
+            return product.sellPrice;
+        }
+    } else {
+        if (
+            toNumber(
+                product.buyPrice
+            ) > 0
+        ) {
+            return product.buyPrice;
+        }
+    }
+
+    const goldPrice =
+        toNumber(
+            product.goldPrice
+        ) ||
+        toNumber(
+            database.settings.goldPrice
+        );
+
+    const goldShopPrice =
+        toNumber(
+            product.goldShopPrice
+        );
+
+    if (
+        goldShopPrice > 0 &&
+        goldPrice > 0
+    ) {
+        return (
+            goldShopPrice *
+            goldPrice
+        );
+    }
+
+    return side === 'sell'
+        ? toNumber(
+            product.lastSellPrice
+        )
+        : toNumber(
+            product.lastBuyPrice
+        );
+}
+
+/*
+|--------------------------------------------------------------------------
+| CALCULATIONS
+|--------------------------------------------------------------------------
+*/
+
+function calculateItem(
+    item,
+    product
+) {
+    const sellTarget =
+        toNumber(
+            item.sellTarget
+        );
+
+    const sellCurrent =
+        toNumber(
+            item.sellCurrent
+        );
+
+    const buyTarget =
+        toNumber(
+            item.buyTarget
+        );
+
+    const buyCurrent =
+        toNumber(
+            item.buyCurrent
+        );
+
+    /*
+     * Что реально продалось
+     * относительно заданного остатка.
+     */
+
+    const sold =
+        Math.max(
+            0,
+            sellTarget -
+            sellCurrent
+        );
+
+    /*
+     * Что было куплено
+     * относительно заданного остатка.
+     */
+
+    const bought =
+        Math.max(
+            0,
+            buyTarget -
+            buyCurrent
+        );
+
+    /*
+     * Сколько нужно докупить,
+     * чтобы вернуть продажный запас
+     * к sellTarget.
+     */
+
+    const needToBuy =
+        Math.max(
+            0,
+            sellTarget -
+            sellCurrent
+        );
+
+    const sellPrice =
+        toNumber(
+            item.sellPrice
+        ) ||
+        toNumber(
+            product.lastSellPrice
+        );
+
+    const buyPrice =
+        toNumber(
+            item.buyPrice
+        ) ||
+        toNumber(
+            product.lastBuyPrice
+        );
+
+    const recommendedSell =
+        getRecommendedPrice(
+            product,
+            'sell'
+        );
+
+    const recommendedBuy =
+        getRecommendedPrice(
+            product,
+            'buy'
+        );
+
+    /*
+     * Финансовая модель:
+     *
+     * Выручка:
+     * sold * фактическая цена продажи
+     *
+     * Покупка:
+     * bought * фактическая цена покупки
+     *
+     * Будущая докупка:
+     * needToBuy * рекомендуемая цена покупки
+     *
+     * Прибыль:
+     * выручка - покупки - докупка
+     */
+
+    const revenue =
+        sold *
+        sellPrice;
+
+    const purchaseCost =
+        bought *
+        buyPrice;
+
+    const restockCost =
+        needToBuy *
+        recommendedBuy;
+
+    const profit =
+        revenue -
+        purchaseCost -
+        restockCost;
+
+    const profitPerSale =
+        sold > 0
+            ? profit / sold
+            : 0;
+
+    return {
+        sellTarget,
+        sellCurrent,
+        sold,
+
+        sellPrice,
+        recommendedSell,
+
+        buyTarget,
+        buyCurrent,
+        bought,
+
+        buyPrice,
+        recommendedBuy,
+
+        needToBuy,
+
+        revenue,
+        purchaseCost,
+        restockCost,
+
+        profit,
+        profitPerSale
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| SNAPSHOTS / HISTORY
+|--------------------------------------------------------------------------
+*/
+
+function makeSnapshot(cat) {
+    return cat.items.map(
+        item => ({
+            productId:
+                item.productId,
+
+            sellCurrent:
+                toNumber(
+                    item.sellCurrent
+                ),
+
+            buyCurrent:
+                toNumber(
+                    item.buyCurrent
+                ),
+
+            sellPrice:
+                toNumber(
+                    item.sellPrice
+                ),
+
+            buyPrice:
+                toNumber(
+                    item.buyPrice
+                )
+        })
+    );
+}
+
+function compareSnapshots(
+    before,
+    after
+) {
+    const beforeMap =
+        new Map(
+            before.map(
+                item => [
+                    item.productId,
+                    item
+                ]
+            )
+        );
+
+    const changes = [];
+
+    for (
+        const current
+        of after
+    ) {
+        const previous =
+            beforeMap.get(
+                current.productId
+            );
+
+        if (!previous) {
+            changes.push({
+                productId:
+                    current.productId,
+
+                type: 'added'
+            });
+
+            continue;
+        }
+
+        const fields = [
+            'sellCurrent',
+            'buyCurrent',
+            'sellPrice',
+            'buyPrice'
+        ];
+
+        for (
+            const field
+            of fields
+        ) {
+            if (
+                previous[field] !==
+                current[field]
+            ) {
+                changes.push({
+                    productId:
+                        current.productId,
+
+                    field,
+
+                    from:
+                        previous[field],
+
+                    to:
+                        current[field]
+                });
+            }
+        }
+    }
+
+    return changes;
+}
+
+/*
+|--------------------------------------------------------------------------
+| UPDATE CAT
+|--------------------------------------------------------------------------
+*/
+
+async function updateCat(
+    cat
+) {
+    const before =
+        makeSnapshot(cat);
+
+    /*
+     * Сначала продажа.
+     */
+
+    const sell =
+        await fetchShop(
+            cat.url,
+            'sell'
+        );
+
+    /*
+     * Небольшая пауза между запросами.
+     */
+
+    await sleep(1000);
+
+    /*
+     * Затем покупка.
+     */
+
+    const buy =
+        await fetchShop(
+            cat.url,
+            'buy'
+        );
+
+    const sellMap =
+        new Map();
+
+    const buyMap =
+        new Map();
+
+    for (
+        const item
+        of sell.items
+    ) {
+        sellMap.set(
+            item.externalId,
+            item
+        );
+    }
+
+    for (
+        const item
+        of buy.items
+    ) {
+        buyMap.set(
+            item.externalId,
+            item
+        );
+    }
+
+    /*
+     * Все товары из sell + buy
+     * автоматически добавляются
+     * в общую БД.
+     */
+
+    const allItems = [
+        ...sell.items,
+        ...buy.items
+    ];
+
+    for (
+        const parsedItem
+        of allItems
+    ) {
+        const product =
+            getOrCreateProduct(
+                parsedItem
+            );
+
+        const catItem =
+            getOrCreateCatItem(
+                cat,
+                product
+            );
+
+        const sellItem =
+            sellMap.get(
+                product.externalId
+            );
+
+        const buyItem =
+            buyMap.get(
+                product.externalId
+            );
+
+        if (sellItem) {
+            catItem.sellCurrent =
+                sellItem.count;
+
+            catItem.sellPrice =
+                sellItem.price;
+
+            catItem.lastSellUpdate =
+                now();
+
+            product.lastSellPrice =
+                sellItem.price;
+        }
+
+        if (buyItem) {
+            catItem.buyCurrent =
+                buyItem.count;
+
+            catItem.buyPrice =
+                buyItem.price;
+
+            catItem.lastBuyUpdate =
+                now();
+
+            product.lastBuyPrice =
+                buyItem.price;
+        }
+    }
+
+    /*
+     * Информация о магазине.
+     */
+
+    const meta =
+        sell.meta || {};
+
+    if (meta.catName) {
+        cat.parsedName =
+            meta.catName;
+    }
+
+    if (meta.shopName) {
+        cat.shopName =
+            meta.shopName;
+    }
+
+    if (meta.location) {
+        cat.location =
+            meta.location;
+    }
+
+    if (
+        meta.x !== null
+    ) {
+        cat.x =
+            meta.x;
+    }
+
+    if (
+        meta.y !== null
+    ) {
+        cat.y =
+            meta.y;
+    }
+
+    cat.lastUpdatedAt =
+        now();
+
+    /*
+     * Сохраняем историю изменения.
+     */
+
+    const after =
+        makeSnapshot(cat);
+
+    const changes =
+        compareSnapshots(
+            before,
+            after
+        );
+
+    database.history.push({
+        id: createId(),
+
+        type: 'update',
+
+        catId:
+            cat.id,
+
+        createdAt:
+            now(),
+
+        changes,
+
+        snapshot:
+            after
+    });
+
+    /*
+     * Ограничиваем размер истории.
+     */
+
+    if (
+        database.history.length >
+        50000
+    ) {
+        database.history.splice(
+            0,
+            database.history.length -
+            50000
+        );
+    }
+
+    saveDatabase();
+
+    return {
+        sellItems:
+            sell.items.length,
+
+        buyItems:
+            buy.items.length,
+
+        changes:
+            changes.length
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| API
+|--------------------------------------------------------------------------
+*/
+
+app.use(
+    express.json({
+        limit: '2mb'
+    })
+);
+
+/*
+ * Вся текущая база.
+ */
+
+app.get(
+    '/api/state',
+    (req, res) => {
+        res.json({
+            settings:
+                database.settings,
+
+            products:
+                database.products,
+
+            cats:
+                database.cats.map(
+                    buildCatResponse
+                )
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| SETTINGS
+|--------------------------------------------------------------------------
+*/
+
+app.put(
+    '/api/settings',
+    (req, res) => {
+        database.settings.updateIntervalMs =
+            Math.max(
+                1000,
+                toInt(
+                    req.body.updateIntervalMs,
+                    7000
+                )
+            );
+
+        database.settings.goldPrice =
+            Math.max(
+                0,
+                toNumber(
+                    req.body.goldPrice
+                )
+            );
+
+        saveDatabase();
+
+        res.json(
+            database.settings
+        );
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CATS
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    '/api/cats',
+    (req, res) => {
+        const url =
+            normalizeUrl(
+                req.body.url
+            );
+
+        if (!url) {
+            return res
+                .status(400)
+                .json({
+                    error:
+                        'Не указана ссылка comeback.pw'
+                });
+        }
+
+        const cat = {
+            id: createId(),
+
+            name:
+                cleanText(
+                    req.body.name
+                ) ||
+                `Кот ${
+                    database.cats.length + 1
+                }`,
+
+            url,
+
+            comebackCatId:
+                getCatIdFromUrl(
+                    url
+                ),
+
+            shopId:
+                getQueryParameter(
+                    url,
+                    'shop'
+                ),
+
+            parsedName: '',
+
+            shopName: '',
+
+            location: '',
+
+            x: null,
+
+            y: null,
+
+            items: [],
+
+            updating: false,
+
+            updateError: null,
+
+            createdAt: now(),
+
+            lastUpdatedAt: null
+        };
+
+        database.cats.push(
+            cat
+        );
+
+        saveDatabase();
+
+        res.json(
+            buildCatResponse(
+                cat
+            )
+        );
+    }
+);
+
+app.put(
+    '/api/cats/:id',
+    (req, res) => {
+        const cat =
+            database.cats.find(
+                item =>
+                    item.id ===
+                    req.params.id
+            );
+
+        if (!cat) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Кот не найден'
+                });
+        }
+
+        if (
+            req.body.name !==
+            undefined
+        ) {
+            cat.name =
+                cleanText(
+                    req.body.name
+                );
+        }
+
+        if (
+            req.body.url !==
+            undefined
+        ) {
+            cat.url =
+                normalizeUrl(
+                    req.body.url
+                );
+
+            cat.comebackCatId =
+                getCatIdFromUrl(
+                    cat.url
+                );
+
+            cat.shopId =
+                getQueryParameter(
+                    cat.url,
+                    'shop'
+                );
+        }
+
+        saveDatabase();
+
+        res.json(
+            buildCatResponse(
+                cat
+            )
+        );
+    }
+);
+
+app.delete(
+    '/api/cats/:id',
+    (req, res) => {
+        const index =
+            database.cats.findIndex(
+                cat =>
+                    cat.id ===
+                    req.params.id
+            );
+
+        if (index === -1) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Кот не найден'
+                });
+        }
+
+        database.cats.splice(
+            index,
+            1
+        );
+
+        saveDatabase();
+
+        res.json({
+            ok: true
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| CAT ITEM SETTINGS
+|--------------------------------------------------------------------------
+*/
+
+app.put(
+    '/api/cats/:catId/items/:productId',
+    (req, res) => {
+        const cat =
+            database.cats.find(
+                item =>
+                    item.id ===
+                    req.params.catId
+            );
+
+        if (!cat) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Кот не найден'
+                });
+        }
+
+        const product =
+            database.products.find(
+                item =>
+                    item.id ===
+                    req.params.productId
+            );
+
+        if (!product) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Товар не найден'
+                });
+        }
+
+        const item =
+            getOrCreateCatItem(
+                cat,
+                product
+            );
+
+        if (
+            req.body.sellTarget !==
+            undefined
+        ) {
+            item.sellTarget =
+                Math.max(
+                    0,
+                    toInt(
+                        req.body.sellTarget
+                    )
+                );
+        }
+
+        if (
+            req.body.buyTarget !==
+            undefined
+        ) {
+            item.buyTarget =
+                Math.max(
+                    0,
+                    toInt(
+                        req.body.buyTarget
+                    )
+                );
+        }
+
+        saveDatabase();
+
+        res.json(
+            buildCatResponse(
+                cat
+            )
+        );
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| PRODUCTS
+|--------------------------------------------------------------------------
+*/
+
+app.put(
+    '/api/products/:id',
+    (req, res) => {
+        const product =
+            database.products.find(
+                item =>
+                    item.id ===
+                    req.params.id
+            );
+
+        if (!product) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Товар не найден'
+                });
+        }
+
+        const priceFields = [
+            'buyPrice',
+            'sellPrice',
+            'goldShopPrice',
+            'goldPrice'
+        ];
+
+        for (
+            const field
+            of priceFields
+        ) {
+            if (
+                req.body[field] !==
+                undefined
+            ) {
+                product[field] =
+                    Math.max(
+                        0,
+                        toNumber(
+                            req.body[field]
+                        )
+                    );
+            }
+        }
+
+        product.configured =
+            product.buyPrice > 0 ||
+            product.sellPrice > 0 ||
+            product.goldShopPrice > 0 ||
+            product.goldPrice > 0;
+
+        product.updatedAt =
+            now();
+
+        saveDatabase();
+
+        res.json(product);
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| UPDATE ONE CAT
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    '/api/cats/:id/update',
+    async (req, res) => {
+        const cat =
+            database.cats.find(
+                item =>
+                    item.id ===
+                    req.params.id
+            );
+
+        if (!cat) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Кот не найден'
+                });
+        }
+
+        if (cat.updating) {
+            return res
+                .status(409)
+                .json({
+                    error:
+                        'Кот уже обновляется'
+                });
+        }
+
+        cat.updating = true;
+
+        cat.updateError = null;
+
+        saveDatabase();
+
+        try {
+            const result =
+                await updateCat(
+                    cat
+                );
+
+            cat.updating =
+                false;
+
+            saveDatabase();
+
+            res.json({
+                ok: true,
+
+                result,
+
+                cat:
+                    buildCatResponse(
+                        cat
+                    )
+            });
+        } catch (error) {
+            cat.updating =
+                false;
+
+            cat.updateError =
+                error.message;
+
+            saveDatabase();
+
+            res
+                .status(500)
+                .json({
+                    error:
+                        error.message
+                });
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| UPDATE ALL
+|--------------------------------------------------------------------------
+*/
+
+let updateAllRunning =
+    false;
+
+app.post(
+    '/api/cats/update-all',
+    async (req, res) => {
+        if (updateAllRunning) {
+            return res
+                .status(409)
+                .json({
+                    error:
+                        'Обновление уже выполняется'
+                });
+        }
+
+        updateAllRunning = true;
+
+        const results = [];
+
+        try {
+            for (
+                let index = 0;
+                index <
+                database.cats.length;
+                index++
+            ) {
+                const cat =
+                    database.cats[index];
+
+                cat.updating =
+                    true;
+
+                cat.updateError =
+                    null;
+
+                saveDatabase();
+
+                try {
+                    const result =
+                        await updateCat(
+                            cat
+                        );
+
+                    results.push({
+                        catId:
+                            cat.id,
+
+                        ok: true,
+
+                        result
+                    });
+                } catch (error) {
+                    cat.updateError =
+                        error.message;
+
+                    results.push({
+                        catId:
+                            cat.id,
+
+                        ok: false,
+
+                        error:
+                            error.message
+                    });
+                }
+
+                cat.updating =
+                    false;
+
+                saveDatabase();
+
+                /*
+                 * Интервал между котами.
+                 */
+
+                if (
+                    index <
+                    database.cats.length -
+                    1
+                ) {
+                    await sleep(
+                        Math.max(
+                            1000,
+                            toInt(
+                                database
+                                    .settings
+                                    .updateIntervalMs,
+                                7000
+                            )
+                        )
+                    );
+                }
+            }
+
+            res.json({
+                ok: true,
+
+                results
+            });
+        } finally {
+            updateAllRunning =
+                false;
+        }
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| RESET
+|--------------------------------------------------------------------------
+*/
+
+app.post(
+    '/api/cats/:id/reset',
+    (req, res) => {
+        const cat =
+            database.cats.find(
+                item =>
+                    item.id ===
+                    req.params.id
+            );
+
+        if (!cat) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Кот не найден'
+                });
+        }
+
+        database.history.push({
+            id: createId(),
+
+            type: 'reset',
+
+            catId:
+                cat.id,
+
+            createdAt:
+                now(),
+
+            snapshot:
+                makeSnapshot(
+                    cat
+                )
+        });
+
+        saveDatabase();
+
+        res.json({
+            ok: true
+        });
+    }
+);
+
+app.post(
+    '/api/reset-all',
+    (req, res) => {
+        database.history.push({
+            id: createId(),
+
+            type: 'reset-all',
+
+            createdAt:
+                now(),
+
+            cats:
+                database.cats.map(
+                    cat => ({
+                        catId:
+                            cat.id,
+
+                        snapshot:
+                            makeSnapshot(
+                                cat
+                            )
+                    })
+                )
+        });
+
+        saveDatabase();
+
+        res.json({
+            ok: true
+        });
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| STATISTICS
+|--------------------------------------------------------------------------
+*/
+
+function calculateCatStats(
+    cat
+) {
+    const result = {
+        sold: 0,
+
+        bought: 0,
+
+        revenue: 0,
+
+        purchaseCost: 0,
+
+        restockCost: 0,
+
+        profit: 0
+    };
+
+    for (
+        const item
+        of cat.items
+    ) {
+        const product =
+            database.products.find(
+                p =>
+                    p.id ===
+                    item.productId
+            );
+
+        if (!product) {
+            continue;
+        }
+
+        const calculated =
+            calculateItem(
+                item,
+                product
+            );
+
+        result.sold +=
+            calculated.sold;
+
+        result.bought +=
+            calculated.bought;
+
+        result.revenue +=
+            calculated.revenue;
+
+        result.purchaseCost +=
+            calculated.purchaseCost;
+
+        result.restockCost +=
+            calculated.restockCost;
+
+        result.profit +=
+            calculated.profit;
+    }
+
+    return result;
+}
+
+app.get(
+    '/api/stats/cat/:id',
+    (req, res) => {
+        const cat =
+            database.cats.find(
+                item =>
+                    item.id ===
+                    req.params.id
+            );
+
+        if (!cat) {
+            return res
+                .status(404)
+                .json({
+                    error:
+                        'Кот не найден'
+                });
+        }
+
+        res.json(
+            calculateCatStats(
+                cat
+            )
+        );
+    }
+);
+
+app.get(
+    '/api/stats/all',
+    (req, res) => {
+        const total = {
+            sold: 0,
+
+            bought: 0,
+
+            revenue: 0,
+
+            purchaseCost: 0,
+
+            restockCost: 0,
+
+            profit: 0
+        };
+
+        const cats =
+            database.cats.map(
+                cat => {
+                    const stats =
+                        calculateCatStats(
+                            cat
+                        );
+
+                    return {
+                        catId:
+                            cat.id,
+
+                        name:
+                            cat.name,
+
+                        ...stats
+                    };
+                }
+            );
+
+        for (
+            const stats
+            of cats
+        ) {
+            total.sold +=
+                stats.sold;
+
+            total.bought +=
+                stats.bought;
+
+            total.revenue +=
+                stats.revenue;
+
+            total.purchaseCost +=
+                stats.purchaseCost;
+
+            total.restockCost +=
+                stats.restockCost;
+
+            total.profit +=
+                stats.profit;
+        }
+
+        res.json({
+            total,
+            cats
+        });
+    }
+);
+
+app.get(
+    '/api/history/:catId',
+    (req, res) => {
+        const limit =
+            Math.min(
+                1000,
+                Math.max(
+                    1,
+                    toInt(
+                        req.query.limit,
+                        100
+                    )
+                )
+            );
+
+        res.json(
+            database.history
+                .filter(
+                    entry =>
+                        entry.catId ===
+                        req.params.catId
+                )
+                .slice(-limit)
+                .reverse()
+        );
+    }
+);
+
+/*
+|--------------------------------------------------------------------------
+| RESPONSE
+|--------------------------------------------------------------------------
+*/
+
+function buildCatResponse(
+    cat
+) {
+    return {
+        ...cat,
+
+        items:
+            cat.items
+                .map(
+                    item => {
+                        const product =
+                            database
+                                .products
+                                .find(
+                                    p =>
+                                        p.id ===
+                                        item.productId
+                                );
+
+                        if (!product) {
+                            return null;
+                        }
+
+                        const calculated =
+                            calculateItem(
+                                item,
+                                product
+                            );
+
+                        return {
+                            ...item,
+
+                            productId:
+                                product.id,
+
+                            externalId:
+                                product.externalId,
+
+                            name:
+                                product.name,
+
+                            image:
+                                product.image,
+
+                            configured:
+                                product.configured,
+
+                            ...calculated
+                        };
+                    }
+                )
+                .filter(Boolean)
+    };
+}
+
+/*
+|--------------------------------------------------------------------------
+| FRONTEND
+|--------------------------------------------------------------------------
+*/
+
+const HTML = `<!doctype html>
+
+<html lang="ru">
+
+<head>
+
+<meta charset="UTF-8">
+
+<meta
+    name="viewport"
+    content="width=device-width,initial-scale=1"
+/>
+
+<title>Perfect World Cat Manager</title>
+
+<style>
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+
+    background: #0d1117;
+
+    color: #e6edf3;
+
+    font-family:
+        Arial,
+        sans-serif;
+
+    font-size: 14px;
+}
+
+button,
+input {
+    font: inherit;
+}
+
+button {
+    cursor: pointer;
+}
+
+.app {
+    display: flex;
+
+    width: 100vw;
+
+    height: 100vh;
+}
+
+.sidebar {
+    width: 270px;
+
+    min-width: 270px;
+
+    display: flex;
+
+    flex-direction: column;
+
+    background: #090d12;
+
+    border-right:
+        1px solid #29313b;
+}
+
+.logo {
+    padding: 18px;
+
+    font-size: 18px;
+
+    font-weight: 700;
+
+    border-bottom:
+        1px solid #29313b;
+}
+
+.logo small {
+    display: block;
+
+    margin-top: 5px;
+
+    color: #8996a5;
+
+    font-size: 11px;
+
+    font-weight: 400;
+}
+
+.cat-list {
+    flex: 1;
+
+    overflow-y: auto;
+
+    padding: 10px;
+}
+
+.cat-button {
+    display: block;
+
+    width: 100%;
+
+    margin-bottom: 5px;
+
+    padding: 10px;
+
+    border:
+        1px solid transparent;
+
+    border-radius: 7px;
+
+    background: transparent;
+
+    color: #e6edf3;
+
+    text-align: left;
+}
+
+.cat-button:hover,
+.cat-button.active {
+    background: #171e27;
+
+    border-color:
+        #29313b;
+}
+
+.cat-meta {
+    margin-top: 4px;
+
+    color: #8996a5;
+
+    font-size: 11px;
+}
+
+.sidebar-bottom {
+    padding: 10px;
+
+    border-top:
+        1px solid #29313b;
+}
+
+.main {
+    min-width: 0;
+
+    flex: 1;
+
+    overflow: auto;
+}
+
+.header {
+    position: sticky;
+
+    top: 0;
+
+    z-index: 10;
+
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 15px;
+
+    padding:
+        16px 20px;
+
+    background:
+        rgba(13,17,23,.96);
+
+    border-bottom:
+        1px solid #29313b;
+}
+
+.title {
+    font-size: 21px;
+
+    font-weight: 700;
+}
+
+.subtitle {
+    margin-top: 4px;
+
+    color: #8996a5;
+
+    font-size: 11px;
+}
+
+.actions {
+    display: flex;
+
+    flex-wrap: wrap;
+
+    gap: 6px;
+}
+
+.button {
+    padding:
+        8px 11px;
+
+    border:
+        1px solid #34404d;
+
+    border-radius: 6px;
+
+    background: #18212b;
+
+    color: #e6edf3;
+}
+
+.button:hover {
+    background: #222c38;
+}
+
+.button.primary {
+    background: #245487;
+
+    border-color: #3672ae;
+}
+
+.button.danger {
+    color: #ff9b9b;
+}
+
+.content {
+    padding:
+        18px 20px 50px;
+}
+
+.stats {
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            5,
+            minmax(120px, 1fr)
+        );
+
+    gap: 8px;
+
+    margin-bottom: 12px;
+}
+
+.stat {
+    padding: 12px;
+
+    background: #151b23;
+
+    border:
+        1px solid #29313b;
+
+    border-radius: 8px;
+}
+
+.stat-label {
+    color: #8996a5;
+
+    font-size: 11px;
+}
+
+.stat-value {
+    margin-top: 5px;
+
+    font-size: 19px;
+
+    font-weight: 700;
+}
+
+.good {
+    color: #59d68a;
+}
+
+.bad {
+    color: #ff7070;
+}
+
+.warning {
+    color: #ffb45c;
+}
+
+.panel {
+    margin-bottom: 12px;
+
+    overflow: hidden;
+
+    background: #151b23;
+
+    border:
+        1px solid #29313b;
+
+    border-radius: 8px;
+}
+
+.panel-header {
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    gap: 10px;
+
+    padding:
+        11px 13px;
+
+    border-bottom:
+        1px solid #29313b;
+}
+
+.info {
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            4,
+            minmax(150px, 1fr)
+        );
+
+    gap: 8px;
+
+    padding: 12px;
+}
+
+.info-card {
+    padding: 9px;
+
+    background: #10161d;
+
+    border-radius: 6px;
+}
+
+.info-label {
+    margin-bottom: 4px;
+
+    color: #8996a5;
+
+    font-size: 10px;
+}
+
+.table-wrapper {
+    overflow: auto;
+}
+
+table {
+    width: 100%;
+
+    min-width: 1500px;
+
+    border-collapse:
+        collapse;
+}
+
+th,
+td {
+    padding: 7px;
+
+    border-bottom:
+        1px solid #252d36;
+
+    text-align: left;
+
+    white-space: nowrap;
+}
+
+th {
+    position: sticky;
+
+    top: 0;
+
+    z-index: 2;
+
+    background: #11171e;
+
+    color: #8996a5;
+
+    font-size: 11px;
+}
+
+td {
+    font-size: 12px;
+}
+
+.product {
+    display: flex;
+
+    align-items: center;
+
+    gap: 7px;
+
+    min-width: 220px;
+}
+
+.product-image {
+    width: 34px;
+
+    height: 34px;
+
+    object-fit: contain;
+
+    background: #0d1117;
+
+    border:
+        1px solid #29313b;
+
+    border-radius: 5px;
+}
+
+.product-name {
+    max-width: 200px;
+
+    overflow: hidden;
+
+    text-overflow: ellipsis;
+}
+
+.input {
+    width: 80px;
+
+    padding: 5px;
+
+    background: #0c1218;
+
+    color: #e6edf3;
+
+    border:
+        1px solid #34404d;
+
+    border-radius: 5px;
+}
+
+.muted {
+    color: #8996a5;
+}
+
+.modal {
+    position: fixed;
+
+    inset: 0;
+
+    z-index: 100;
+
+    display: none;
+
+    align-items: center;
+
+    justify-content: center;
+
+    padding: 15px;
+
+    background:
+        rgba(0,0,0,.75);
+}
+
+.modal.open {
+    display: flex;
+}
+
+.modal-window {
+    width:
+        min(
+            900px,
+            100%
+        );
+
+    max-height:
+        calc(
+            100vh - 30px
+        );
+
+    overflow: auto;
+
+    background: #151b23;
+
+    border:
+        1px solid #29313b;
+
+    border-radius: 9px;
+}
+
+.modal-header,
+.modal-footer {
+    display: flex;
+
+    align-items: center;
+
+    justify-content: space-between;
+
+    padding:
+        12px 14px;
+
+    border-bottom:
+        1px solid #29313b;
+}
+
+.modal-footer {
+    justify-content: flex-end;
+
+    gap: 6px;
+
+    border-top:
+        1px solid #29313b;
+
+    border-bottom: 0;
+}
+
+.modal-body {
+    padding: 14px;
+}
+
+.field {
+    margin-bottom: 12px;
+}
+
+.field label {
+    display: block;
+
+    margin-bottom: 5px;
+
+    color: #8996a5;
+
+    font-size: 11px;
+}
+
+.field input {
+    width: 100%;
+
+    padding: 8px;
+
+    background: #0c1218;
+
+    color: #e6edf3;
+
+    border:
+        1px solid #34404d;
+
+    border-radius: 6px;
+}
+
+.product-editor {
+    margin-bottom: 8px;
+
+    padding: 10px;
+
+    border:
+        1px solid #29313b;
+
+    border-radius: 7px;
+}
+
+.product-editor-grid {
+    display: grid;
+
+    grid-template-columns:
+        repeat(
+            4,
+            1fr
+        );
+
+    gap: 8px;
+}
+
+.empty {
+    padding: 50px;
+
+    color: #8996a5;
+
+    text-align: center;
+}
+
+@media (
+    max-width: 1000px
+) {
+
+    .stats {
+        grid-template-columns:
+            repeat(
+                2,
+                1fr
+            );
+    }
+
+    .info {
+        grid-template-columns:
+            repeat(
+                2,
+                1fr
+            );
+    }
+
+    .header {
+        align-items: flex-start;
+
+        flex-direction: column;
+    }
+
+}
+
+</style>
+
+</head>
+
+<body>
+
+<div class="app">
+
+    <aside class="sidebar">
+
+        <div class="logo">
+
+            Perfect World
+
+            <small>
+                Cat Manager
+            </small>
+
+        </div>
+
+        <div
+            class="cat-list"
+            id="catList"
+        ></div>
+
+        <div class="sidebar-bottom">
+
+            <button
+                class="button primary"
+                style="width:100%;margin-bottom:6px"
+                onclick="createCatDialog()"
+            >
+                + Новый кот
+            </button>
+
+            <button
+                class="button"
+                style="width:100%"
+                onclick="openProducts()"
+            >
+                База товаров
+            </button>
+
+        </div>
+
+    </aside>
+
+    <main class="main">
+
+        <header class="header">
+
+            <div>
+
+                <div
+                    class="title"
+                    id="pageTitle"
+                >
+                    Коты
+                </div>
+
+                <div
+                    class="subtitle"
+                    id="pageSubtitle"
+                >
+                    Выберите кота
+                </div>
+
+            </div>
+
+            <div class="actions">
+
+                <button
+                    class="button"
+                    onclick="updateAllCats()"
+                >
+                    Обновить всех
+                </button>
+
+                <button
+                    class="button"
+                    onclick="openAllStats()"
+                >
+                    Статистика всех
+                </button>
+
+                <button
+                    class="button"
+                    onclick="openSettings()"
+                >
+                    Настройки
+                </button>
+
+            </div>
+
+        </header>
+
+        <div
+            class="content"
+            id="content"
+        ></div>
+
+    </main>
+
+</div>
+
+<div
+    class="modal"
+    id="modal"
+>
+
+    <div class="modal-window">
+
+        <div class="modal-header">
+
+            <b id="modalTitle"></b>
+
+            <button
+                class="button"
+                onclick="closeModal()"
+            >
+                ×
+            </button>
+
+        </div>
+
+        <div
+            class="modal-body"
+            id="modalBody"
+        ></div>
+
+        <div
+            class="modal-footer"
+            id="modalFooter"
+        ></div>
+
+    </div>
+
+</div>
+
+<script>
+
+let state = {
+    settings: {},
+
+    products: [],
+
+    cats: []
+};
+
+let selectedCatId = null;
+
+let editingCatId = null;
+
+const $ =
+    id =>
+        document.getElementById(id);
+
+
+/*
+|--------------------------------------------------------------------------
+| API
+|--------------------------------------------------------------------------
+*/
+
+async function api(
+    url,
+    options = {}
+) {
+    const response =
+        await fetch(
+            url,
+            {
+                headers: {
+                    'Content-Type':
+                        'application/json',
+
+                    ...(options.headers || {})
+                },
+
+                ...options
+            }
+        );
+
+    const text =
+        await response.text();
+
+    let data;
+
+    try {
+        data =
+            JSON.parse(text);
+    } catch {
+        data = {
+            error: text
+        };
+    }
+
+    if (!response.ok) {
+        throw new Error(
+            data.error ||
+            (
+                'HTTP ' +
+                response.status
+            )
+        );
+    }
+
+    return data;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| LOAD
+|--------------------------------------------------------------------------
+*/
+
+async function loadState() {
+
+    state =
+        await api(
+            '/api/state'
+        );
+
+    render();
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| FORMAT
+|--------------------------------------------------------------------------
+*/
+
+function escapeHtml(value) {
+
+    return String(
+        value ?? ''
+    ).replace(
+        /[&<>"']/g,
+        character => ({
+            '&':
+                '&amp;',
+
+            '<':
+                '&lt;',
+
+            '>':
+                '&gt;',
+
+            '"':
+                '&quot;',
+
+            "'":
+                '&#39;'
+        })[
+            character
+        ]
+    );
+
+}
+
+function money(value) {
+
+    return Number(
+        value || 0
+    ).toLocaleString(
+        'ru-RU',
+        {
+            maximumFractionDigits: 2
+        }
+    );
+
+}
+
+function quantity(value) {
+
+    return Number(
+        value || 0
+    ).toLocaleString(
+        'ru-RU',
+        {
+            maximumFractionDigits: 0
+        }
+    );
+
+}
+
+function formatDate(value) {
+
+    if (!value) {
+        return '—';
+    }
+
+    return new Date(
+        value
+    ).toLocaleString(
+        'ru-RU'
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| CURRENT CAT
+|--------------------------------------------------------------------------
+*/
+
+function currentCat() {
+
+    return state.cats.find(
+        cat =>
+            cat.id ===
+            selectedCatId
+    );
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| RENDER
+|--------------------------------------------------------------------------
+*/
+
+function render() {
+
+    renderCatList();
+
+    const cat =
+        currentCat();
+
+    if (cat) {
+        renderCat(
+            cat
+        );
+    } else {
+        renderEmpty();
+    }
+
+}
+
+function renderCatList() {
+
+    if (
+        state.cats.length ===
+        0
+    ) {
+        $('catList').innerHTML =
+            '<div class="empty" style="padding:30px 5px">Нет котов</div>';
+
+        return;
+    }
+
+    $('catList').innerHTML =
+        state.cats
+            .map(
+                cat => `
+                    <button
+                        class="cat-button ${
+                            cat.id ===
+                            selectedCatId
+                                ? 'active'
+                                : ''
+                        }"
+                        onclick="selectCat('${cat.id}')"
+                    >
+
+                        <b>
+                            ${escapeHtml(
+                                cat.name
+                            )}
+                        </b>
+
+                        <div class="cat-meta">
+
+                            ${
+                                cat.updating
+                                    ? 'Обновляется...'
+                                    : (
+                                        cat.lastUpdatedAt
+                                            ? formatDate(
+                                                cat.lastUpdatedAt
+                                            )
+                                            : 'Ещё не обновлялся'
+                                    )
+                            }
+
+                        </div>
+
+                    </button>
+                `
+            )
+            .join('');
+
+}
+
+function selectCat(id) {
+
+    selectedCatId =
+        id;
+
+    render();
+
+}
+
+function renderEmpty() {
+
+    $('pageTitle').textContent =
+        'Коты';
+
+    $('pageSubtitle').textContent =
+        'Выберите кота или создайте нового';
+
+    $('content').innerHTML = `
+        <div class="panel">
+
+            <div class="empty">
+
+                🐱
+
+                <br><br>
+
+                Добавьте первого кота.
+
+            </div>
+
+        </div>
+    `;
+
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| CAT
+|--------------------------------------------------------------------------
+*/
+
+function renderCat(cat) {
+
+    $('pageTitle').textContent =
+        cat.name;
+
+    $('pageSubtitle').textContent =
+        cat.parsedName ||
+        cat.url;
+
+    let sold = 0;
+    let bought = 0;
+    let revenue = 0;
+    let restock = 0;
+    let profit = 0;
+
+    for (
+        const item
+        of cat.items
+    ) {
+        sold +=
+            Number(
+                item.sold || 0
+            );
+
+        bought +=
+            Number(
+                item.bought || 0
+            );
+
+        revenue +=
+            Number(
+                item.revenue || 0
+            );
+
+        restock +=
+            Number(
+                item.restockCost || 0
+            );
+
+        profit +=
+            Number(
+                item.profit || 0
+            );
+    }
+
+    $('content').innerHTML = `
+
+        <div class="stats">
+
+            ${statCard(
+                'Продано',
+                quantity(sold)
+            )}
+
+            ${statCard(
+                'Куплено',
+                quantity(bought)
+            )}
+
+            ${statCard(
+                'Выручка',
+                money(revenue)
+            )}
+
+            ${statCard(
+                'Докупка',
+                money(restock)
+            )}
+
+            ${statCard(
+                'Прибыль',
+                money(profit),
+                profit >= 0
+                    ? 'good'
+                    : 'bad'
+            )}
+
+        </div>
+
+        <div class="panel">
+
+            <div class="panel-header">
+
+                <b>
+                    Информация о коте
+                </b>
+
+                <div class="actions">
+
+                    <button
+                        class="button"
+                        onclick="editCurrentCat()"
+                    >
+                        Изменить
+                    </button>
+
+                    <button
+                        class="button primary"
+                        onclick="updateCurrentCat()"
+                    >
+                        Обновить
+                    </button>
+
+                    <button
+                        class="button"
+                        onclick="openCatStats()"
+                    >
+                        Статистика
+                    </button>
+
+                    <button
+                        class="button danger"
+                        onclick="resetCurrentCat()"
+                    >
+                        Сброс
+                    </button>
+
+                    <button
+                        class="button danger"
+                        onclick="deleteCurrentCat()"
+                    >
+                        Удалить
+                    </button>
+
+                </div>
+
+            </div>
+
+            <div class="info">
+
+                ${infoCard(
+                    'Имя',
+                    cat.parsedName ||
+                    cat.name
+                )}
+
+                ${infoCard(
+                    'Магазин',
+                    cat.shopName ||
+                    '—'
+                )}
+
+                ${infoCard(
+                    'Локация',
+                    cat.location ||
+                    '—'
+                )}
+
+                ${infoCard(
+                    'Координаты',
+                    cat.x !== null
+                        ? `${cat.x} : ${cat.y}`
+                        : '—'
+                )}
+
+                <div
+                    class="info-card"
+                    style="grid-column:1/-1"
+                >
+
+                    <div class="info-label">
+                        Ссылка comeback.pw
+                    </div>
+
+                    <a
+                        href="${escapeHtml(cat.url)}"
+                        target="_blank"
+                        style="color:#6ea8fe"
+                    >
+                        ${escapeHtml(cat.url)}
+                    </a>
+
+                </div>
+
+            </div>
+
+        </div>
+
+        <div class="panel">
+
+            <div class="panel-header">
+
+                <b>
+                    Товары
+                    (${cat.items.length})
+                </b>
+
+            </div>
+
+            <div class="table-wrapper">
+
+                <table>
+
+                    <thead>
+
+                        <tr>
+
+                            <th>
+                                Товар
+                            </th>
+
+                            <th>
+                                Должно быть
+                                <br>
+                                продажа
+                            </th>
+
+                            <th>
+                                Текущее
+                                <br>
+                                продажа
+                            </th>
+
+                            <th>
+                                Продано
+                            </th>
+
+                            <th>
+                                Цена
+                                <br>
+                                продажа
+                            </th>
+
+                            <th>
+                                Рекоменд.
+                                <br>
+                                продажа
+                            </th>
+
+                            <th>
+                                Должно быть
+                                <br>
+                                покупка
+                            </th>
+
+                            <th>
+                                Текущее
+                                <br>
+                                покупка
+                            </th>
+
+                            <th>
+                                Куплено
+                            </th>
+
+                            <th>
+                                Цена
+                                <br>
+                                покупка
+                            </th>
+
+                            <th>
+                                Рекоменд.
+                                <br>
+                                покупка
+                            </th>
+
+                            <th>
+                                Нужно
+                                <br>
+                                докупить
+                            </th>
+
+                            <th>
+                                Где лучше
+                                <br>
+                                докупить
+                            </th>
+
+                            <th>
+                                Прибыль
+                            </th>
+
+                            <th>
+                                Прибыль
+                                <br>
+                                / продажа
+                            </th>
+
+                            <th></th>
+
+                        </tr>
+
+                    </thead>
+
+                    <tbody>
+
+                        ${
+                            cat.items
+                                .map(
+                                    item =>
+                                        renderItemRow(
+                                            cat,
+                                            item
+                                        )
+                                )
+                                .join('')
+                        }
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+        </div>
+    `;
+
+}
+
+function statCard(
+    label,
+    value,
+    className = ''
+) {
+    return `
+        <div class="stat">
+
+            <div class="stat-label">
+                ${label}
+            </div>
+
+            <div class="stat-value ${className}">
+                ${value}
+            </div>
+
+        </div>
+    `;
+}
+
+function infoCard(
+    label,
+    value
+) {
+    return `
+        <div class="info-card">
+
+            <div class="info-label">
+                ${label}
+            </div>
+
+            <div>
+                ${escapeHtml(
+                    value
+                )}
+            </div>
+
+        </div>
+    `;
+}
+
+function renderItemRow(
+    cat,
+    item
+) {
+
+    return `
+        <tr>
+
+            <td>
+
+                <div class="product">
+
+                    ${
+                        item.image
+                            ? `
+                                <img
+                                    class="product-image"
+                                    src="${escapeHtml(
+                                        item.image
+                                    )}"
+                                >
+                            `
+                            : ''
+                    }
+
+                    <div>
+
+                        <div
+                            class="${
+                                item.configured
+                                    ? ''
+                                    : 'warning'
+                            }"
+                        >
+                            ${escapeHtml(
+                                item.name
+                            )}
+                        </div>
+
+                        <div class="muted">
+                            ID:
+                            ${escapeHtml(
+                                item.externalId
+                            )}
+                        </div>
+
+                    </div>
+
+                </div>
+
+            </td>
+
+            <td>
+
+                <input
+                    class="input"
+                    type="number"
+                    min="0"
+                    value="${item.sellTarget}"
+                    onchange="
+                        updateCatItem(
+                            '${cat.id}',
+                            '${item.productId}',
+                            'sellTarget',
+                            this.value
+                        )
+                    "
+                >
+
+            </td>
+
+            <td>
+                ${quantity(
+                    item.sellCurrent
+                )}
+            </td>
+
+            <td class="${
+                item.sold > 0
+                    ? 'good'
+                    : ''
+            }">
+
+                ${quantity(
+                    item.sold
+                )}
+
+            </td>
+
+            <td>
+                ${money(
+                    item.sellPrice
+                )}
+            </td>
+
+            <td>
+                ${money(
+                    item.recommendedSell
+                )}
+            </td>
+
+            <td>
+
+                <input
+                    class="input"
+                    type="number"
+                    min="0"
+                    value="${item.buyTarget}"
+                    onchange="
+                        updateCatItem(
+                            '${cat.id}',
+                            '${item.productId}',
+                            'buyTarget',
+                            this.value
+                        )
+                    "
+                >
+
+            </td>
+
+            <td>
+                ${quantity(
+                    item.buyCurrent
+                )}
+            </td>
+
+            <td class="${
+                item.bought > 0
+                    ? 'good'
+                    : ''
+            }">
+
+                ${quantity(
+                    item.bought
+                )}
+
+            </td>
+
+            <td>
+                ${money(
+                    item.buyPrice
+                )}
+            </td>
+
+            <td>
+                ${money(
+                    item.recommendedBuy
+                )}
+            </td>
+
+            <td class="${
+                item.needToBuy > 0
+                    ? 'bad'
+                    : 'good'
+            }">
+
+                ${quantity(
+                    item.needToBuy
+                )}
+
+            </td>
+
+            <td>
+
+                ${
+                    item.needToBuy > 0
+                        ? money(
+                            item.recommendedBuy
+                        )
+                        : '—'
+                }
+
+            </td>
+
+            <td class="${
+                item.profit >= 0
+                    ? 'good'
+                    : 'bad'
+            }">
+
+                ${money(
+                    item.profit
+                )}
+
+            </td>
+
+            <td class="${
+                item.profitPerSale >= 0
+                    ? 'good'
+                    : 'bad'
+            }">
+
+                ${money(
+                    item.profitPerSale
+                )}
+
+            </td>
+
+            <td>
+
+                <button
+                    class="button"
+                    onclick="
+                        editProduct(
+                            '${item.productId}'
+                        )
+                    "
+                >
+                    Настроить
+                </button>
+
+            </td>
+
+        </tr>
+    `;
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| CAT CREATE / EDIT
+|--------------------------------------------------------------------------
+*/
+
+function createCatDialog() {
+
+    editingCatId = null;
+
+    openModal(
+        'Новый кот',
+        `
+            <div class="field">
+
+                <label>
+                    Название
+                </label>
+
+                <input
+                    id="catNameInput"
+                    placeholder="Кот 1"
+                >
+
+            </div>
+
+            <div class="field">
+
+                <label>
+                    Ссылка comeback.pw
+                </label>
+
+                <input
+                    id="catUrlInput"
+                    placeholder="https://comeback.pw/cats/146/?shop=19831968"
+                >
+
+            </div>
+        `,
+        `
+            <button
+                class="button"
+                onclick="closeModal()"
+            >
+                Отмена
+            </button>
+
+            <button
+                class="button primary"
+                onclick="saveCat()"
+            >
+                Создать
+            </button>
+        `
+    );
+}
+
+function editCurrentCat() {
+
+    const cat =
+        currentCat();
+
+    if (!cat) {
+        return;
+    }
+
+    editingCatId =
+        cat.id;
+
+    openModal(
+        'Изменить кота',
+        `
+            <div class="field">
+
+                <label>
+                    Название
+                </label>
+
+                <input
+                    id="catNameInput"
+                    value="${escapeHtml(
+                        cat.name
+                    )}"
+                >
+
+            </div>
+
+            <div class="field">
+
+                <label>
+                    Ссылка comeback.pw
+                </label>
+
+                <input
+                    id="catUrlInput"
+                    value="${escapeHtml(
+                        cat.url
+                    )}"
+                >
+
+            </div>
+        `,
+        `
+            <button
+                class="button"
+                onclick="closeModal()"
+            >
+                Отмена
+            </button>
+
+            <button
+                class="button primary"
+                onclick="saveCat()"
+            >
+                Сохранить
+            </button>
+        `
+    );
+}
+
+async function saveCat() {
+
+    try {
+
+        const body = {
+            name:
+                $('catNameInput')
+                    .value,
+
+            url:
+                $('catUrlInput')
+                    .value
+        };
+
+        if (editingCatId) {
+
+            await api(
+                '/api/cats/' +
+                editingCatId,
+                {
+                    method: 'PUT',
+
+                    body:
+                        JSON.stringify(
+                            body
+                        )
+                }
+            );
+
+        } else {
+
+            const cat =
+                await api(
+                    '/api/cats',
+                    {
+                        method:
+                            'POST',
+
+                        body:
+                            JSON.stringify(
+                                body
+                            )
+                    }
+                );
+
+            selectedCatId =
+                cat.id;
+        }
+
+        closeModal();
+
+        await loadState();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| UPDATE
+|--------------------------------------------------------------------------
+*/
+
+async function updateCurrentCat() {
+
+    if (!selectedCatId) {
+        return;
+    }
+
+    try {
+
+        await api(
+            '/api/cats/' +
+            selectedCatId +
+            '/update',
+            {
+                method: 'POST'
+            }
+        );
+
+        await loadState();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+async function updateAllCats() {
+
+    if (
+        state.cats.length ===
+        0
+    ) {
+        alert(
+            'Нет котов.'
+        );
+
+        return;
+    }
+
+    const confirmed =
+        confirm(
+            'Обновить всех котов последовательно?'
+        );
+
+    if (!confirmed) {
+        return;
+    }
+
+    try {
+
+        await api(
+            '/api/cats/update-all',
+            {
+                method: 'POST'
+            }
+        );
+
+        await loadState();
+
+        alert(
+            'Обновление завершено.'
+        );
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| CAT ITEM
+|--------------------------------------------------------------------------
+*/
+
+async function updateCatItem(
+    catId,
+    productId,
+    field,
+    value
+) {
+
+    try {
+
+        await api(
+            '/api/cats/' +
+            catId +
+            '/items/' +
+            productId,
+            {
+                method: 'PUT',
+
+                body:
+                    JSON.stringify({
+                        [field]:
+                            Number(
+                                value
+                            )
+                    })
+            }
+        );
+
+        await loadState();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| PRODUCTS
+|--------------------------------------------------------------------------
+*/
+
+function openProducts() {
+
+    const body =
+        state.products
+            .map(
+                product => `
+                    <div class="product-editor">
+
+                        <div>
+
+                            <b
+                                class="${
+                                    product.configured
+                                        ? ''
+                                        : 'warning'
+                                }"
+                            >
+                                ${escapeHtml(
+                                    product.name
+                                )}
+                            </b>
+
+                            <span class="muted">
+
+                                ID:
+                                ${escapeHtml(
+                                    product.externalId
+                                )}
+
+                                ${
+                                    product.configured
+                                        ? ''
+                                        : ' — не настроен'
+                                }
+
+                            </span>
+
+                        </div>
+
+                        <div
+                            class="product-editor-grid"
+                        >
+
+                            ${productField(
+                                product,
+                                'buyPrice',
+                                'Скупка'
+                            )}
+
+                            ${productField(
+                                product,
+                                'sellPrice',
+                                'Продажа'
+                            )}
+
+                            ${productField(
+                                product,
+                                'goldShopPrice',
+                                'Цена в gold shop'
+                            )}
+
+                            ${productField(
+                                product,
+                                'goldPrice',
+                                'Цена gold'
+                            )}
+
+                        </div>
+
+                        <button
+                            class="button primary"
+                            onclick="
+                                saveProduct(
+                                    '${product.id}'
+                                )
+                            "
+                        >
+                            Сохранить
+                        </button>
+
+                    </div>
+                `
+            )
+            .join('');
+
+    openModal(
+        'База товаров',
+        body ||
+            '<div class="empty">Товаров пока нет.</div>',
+        `
+            <button
+                class="button"
+                onclick="closeModal()"
+            >
+                Закрыть
+            </button>
+        `
+    );
+}
+
+function productField(
+    product,
+    field,
+    label
+) {
+    return `
+        <div class="field">
+
+            <label>
+                ${label}
+            </label>
+
+            <input
+                id="product-${field}-${product.id}"
+                type="number"
+                min="0"
+                value="${product[field] || 0}"
+            >
+
+        </div>
+    `;
+}
+
+async function saveProduct(
+    productId
+) {
+
+    try {
+
+        await api(
+            '/api/products/' +
+            productId,
+            {
+                method: 'PUT',
+
+                body:
+                    JSON.stringify({
+                        buyPrice:
+                            Number(
+                                $(
+                                    'product-buyPrice-' +
+                                    productId
+                                ).value
+                            ),
+
+                        sellPrice:
+                            Number(
+                                $(
+                                    'product-sellPrice-' +
+                                    productId
+                                ).value
+                            ),
+
+                        goldShopPrice:
+                            Number(
+                                $(
+                                    'product-goldShopPrice-' +
+                                    productId
+                                ).value
+                            ),
+
+                        goldPrice:
+                            Number(
+                                $(
+                                    'product-goldPrice-' +
+                                    productId
+                                ).value
+                            )
+                    })
+            }
+        );
+
+        await loadState();
+
+        openProducts();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+function editProduct(
+    productId
+) {
+
+    openProducts();
+
+    setTimeout(
+        () => {
+
+            const element =
+                document.getElementById(
+                    'product-buyPrice-' +
+                    productId
+                );
+
+            if (element) {
+                element.scrollIntoView({
+                    behavior:
+                        'smooth',
+
+                    block:
+                        'center'
+                });
+            }
+
+        },
+        50
+    );
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| SETTINGS
+|--------------------------------------------------------------------------
+*/
+
+function openSettings() {
+
+    openModal(
+        'Настройки',
+        `
+            <div class="field">
+
+                <label>
+                    Интервал между котами, мс
+                </label>
+
+                <input
+                    id="settingsInterval"
+                    type="number"
+                    min="1000"
+                    value="${
+                        state
+                            .settings
+                            .updateIntervalMs
+                    }"
+                >
+
+            </div>
+
+            <div class="field">
+
+                <label>
+                    Цена gold
+                </label>
+
+                <input
+                    id="settingsGoldPrice"
+                    type="number"
+                    min="0"
+                    value="${
+                        state
+                            .settings
+                            .goldPrice
+                    }"
+                >
+
+            </div>
+        `,
+        `
+            <button
+                class="button"
+                onclick="closeModal()"
+            >
+                Отмена
+            </button>
+
+            <button
+                class="button primary"
+                onclick="saveSettings()"
+            >
+                Сохранить
+            </button>
+        `
+    );
+}
+
+async function saveSettings() {
+
+    try {
+
+        await api(
+            '/api/settings',
+            {
+                method: 'PUT',
+
+                body:
+                    JSON.stringify({
+                        updateIntervalMs:
+                            Number(
+                                $(
+                                    'settingsInterval'
+                                ).value
+                            ),
+
+                        goldPrice:
+                            Number(
+                                $(
+                                    'settingsGoldPrice'
+                                ).value
+                            )
+                    })
+            }
+        );
+
+        closeModal();
+
+        await loadState();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| STATISTICS
+|--------------------------------------------------------------------------
+*/
+
+async function openCatStats() {
+
+    if (!selectedCatId) {
+        return;
+    }
+
+    try {
+
+        const stats =
+            await api(
+                '/api/stats/cat/' +
+                selectedCatId
+            );
+
+        openModal(
+            'Статистика кота',
+            `
+                <div class="stats">
+
+                    ${statCard(
+                        'Продано',
+                        quantity(
+                            stats.sold
+                        )
+                    )}
+
+                    ${statCard(
+                        'Куплено',
+                        quantity(
+                            stats.bought
+                        )
+                    )}
+
+                    ${statCard(
+                        'Выручка',
+                        money(
+                            stats.revenue
+                        )
+                    )}
+
+                    ${statCard(
+                        'Докупка',
+                        money(
+                            stats.restockCost
+                        )
+                    )}
+
+                    ${statCard(
+                        'Прибыль',
+                        money(
+                            stats.profit
+                        ),
+                        stats.profit >= 0
+                            ? 'good'
+                            : 'bad'
+                    )}
+
+                </div>
+            `,
+            `
+                <button
+                    class="button"
+                    onclick="closeModal()"
+                >
+                    Закрыть
+                </button>
+            `
+        );
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+async function openAllStats() {
+
+    try {
+
+        const data =
+            await api(
+                '/api/stats/all'
+            );
+
+        const catRows =
+            data.cats
+                .map(
+                    cat => `
+                        <div class="panel">
+
+                            <div
+                                class="panel-header"
+                            >
+
+                                <b>
+                                    ${escapeHtml(
+                                        cat.name
+                                    )}
+                                </b>
+
+                                <span>
+
+                                    Продано:
+                                    ${quantity(
+                                        cat.sold
+                                    )}
+
+                                    &nbsp; |
+
+                                    Куплено:
+                                    ${quantity(
+                                        cat.bought
+                                    )}
+
+                                    &nbsp; |
+
+                                    Прибыль:
+                                    ${money(
+                                        cat.profit
+                                    )}
+
+                                </span>
+
+                            </div>
+
+                        </div>
+                    `
+                )
+                .join('');
+
+        openModal(
+            'Статистика всех котов',
+            `
+                <div class="stats">
+
+                    ${statCard(
+                        'Продано',
+                        quantity(
+                            data.total.sold
+                        )
+                    )}
+
+                    ${statCard(
+                        'Куплено',
+                        quantity(
+                            data.total.bought
+                        )
+                    )}
+
+                    ${statCard(
+                        'Выручка',
+                        money(
+                            data.total.revenue
+                        )
+                    )}
+
+                    ${statCard(
+                        'Докупка',
+                        money(
+                            data.total.restockCost
+                        )
+                    )}
+
+                    ${statCard(
+                        'Прибыль',
+                        money(
+                            data.total.profit
+                        ),
+                        data.total.profit >= 0
+                            ? 'good'
+                            : 'bad'
+                    )}
+
+                </div>
+
+                ${catRows}
+            `,
+            `
+                <button
+                    class="button"
+                    onclick="closeModal()"
+                >
+                    Закрыть
+                </button>
+            `
+        );
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| RESET / DELETE
+|--------------------------------------------------------------------------
+*/
+
+async function resetCurrentCat() {
+
+    if (!selectedCatId) {
+        return;
+    }
+
+    if (
+        !confirm(
+            'Создать новую точку отсчёта статистики?'
+        )
+    ) {
+        return;
+    }
+
+    try {
+
+        await api(
+            '/api/cats/' +
+            selectedCatId +
+            '/reset',
+            {
+                method: 'POST'
+            }
+        );
+
+        alert(
+            'Сброс сохранён.'
+        );
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+async function deleteCurrentCat() {
+
+    if (!selectedCatId) {
+        return;
+    }
+
+    if (
+        !confirm(
+            'Удалить кота?'
+        )
+    ) {
+        return;
+    }
+
+    try {
+
+        await api(
+            '/api/cats/' +
+            selectedCatId,
+            {
+                method: 'DELETE'
+            }
+        );
+
+        selectedCatId =
+            null;
+
+        await loadState();
+
+    } catch (error) {
+
+        alert(
+            error.message
+        );
+
+    }
+}
+
+
+/*
+|--------------------------------------------------------------------------
+| MODAL
+|--------------------------------------------------------------------------
+*/
+
+function openModal(
+    title,
+    body,
+    footer
+) {
+    $('modalTitle')
+        .textContent =
+        title;
+
+    $('modalBody')
+        .innerHTML =
+        body;
+
+    $('modalFooter')
+        .innerHTML =
+        footer;
+
+    $('modal')
+        .classList
+        .add('open');
+}
+
+function closeModal() {
+
+    $('modal')
+        .classList
+        .remove('open');
+
+}
+
+$('modal')
+    .addEventListener(
+        'click',
+        event => {
+
+            if (
+                event.target ===
+                $('modal')
+            ) {
+                closeModal();
+            }
+
+        }
+    );
+
+
+/*
+|--------------------------------------------------------------------------
+| START
+|--------------------------------------------------------------------------
+*/
+
+loadState()
+    .catch(
+        error => {
+            alert(
+                error.message
+            );
+        }
+    );
+
+</script>
+
+</body>
+
+</html>`;
+
+/*
+|--------------------------------------------------------------------------
+| SERVER
+|--------------------------------------------------------------------------
+*/
+
+app.get(
+    '/',
+    (req, res) => {
+        res
+            .type('html')
+            .send(HTML);
+    }
+);
+
+app.get(
+    '/api/health',
+    (req, res) => {
+        res.json({
+            ok: true,
+
+            cats:
+                database.cats.length,
+
+            products:
+                database.products.length,
+
+            proxy:
+                PROXY_URL
+        });
+    }
+);
+
+app.listen(
+    PORT,
+    () => {
+        console.log('');
+        console.log(
+            '======================================'
+        );
+        console.log(
+            ' Perfect World Cat Manager'
+        );
+        console.log(
+            '======================================'
+        );
+        console.log(
+            `http://localhost:${PORT}`
+        );
+        console.log(
+            `Proxy: ${PROXY_URL}`
+        );
+        console.log(
+            `Database: ${DB_FILE}`
+        );
+        console.log(
+            '======================================'
+        );
+        console.log('');
+    }
+);

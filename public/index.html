@@ -1,0 +1,45 @@
+<!doctype html>
+<html lang="ru">
+<head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>PW Cats — управление котами</title>
+    <link rel="stylesheet" href="styles.css" />
+</head>
+<body>
+    <header class="topbar">
+        <div class="brand">PW Cats</div>
+
+        <div class="topbar-actions">
+            <button id="btn-update-all" class="btn btn-primary">Обновить всех</button>
+            <button id="btn-carry-all" class="btn" title="Перенести текущие количества в «должно быть» у всех котов, без записи в статистику">Перенести всех</button>
+            <button id="btn-reset-all" class="btn" title="Дописать текущие периоды в статистику и перенести количества">Сброс всех</button>
+            <button id="btn-products" class="btn">База товаров</button>
+            <button id="btn-all-stats" class="btn">Статистика</button>
+            <button id="btn-settings" class="btn">Настройки</button>
+        </div>
+    </header>
+
+    <div id="update-banner" class="banner hidden"></div>
+
+    <main class="layout">
+        <aside class="sidebar">
+            <div class="sidebar-head">
+                <span>Коты</span>
+                <button id="btn-add-cat" class="btn btn-small">+ Добавить</button>
+            </div>
+
+            <div id="cat-list" class="cat-list"></div>
+        </aside>
+
+        <section id="content" class="content"></section>
+    </main>
+
+    <div id="modal-root" class="modal-root hidden">
+        <div class="modal-backdrop" data-close></div>
+        <div class="modal" id="modal-body"></div>
+    </div>
+
+    <script src="app.js"></script>
+</body>
+</html>

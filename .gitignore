@@ -1,0 +1,5 @@
+node_modules/
+pw-cats.json
+*.tmp
+.env
+npm-debug.log*

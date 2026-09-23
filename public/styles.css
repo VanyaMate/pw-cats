@@ -1,0 +1,777 @@
+:root {
+    --bg: #12141a;
+    --panel: #1b1e27;
+    --panel-2: #232734;
+    --border: #2e3340;
+    --text: #e6e8ee;
+    --muted: #9aa2b1;
+    --accent: #f0b429;
+    --accent-2: #3b82f6;
+    --green: #34d399;
+    --red: #f87171;
+}
+
+* {
+    box-sizing: border-box;
+}
+
+body {
+    margin: 0;
+    font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+}
+
+.hidden {
+    display: none !important;
+}
+
+.topbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 16px;
+    background: var(--panel);
+    border-bottom: 1px solid var(--border);
+    position: sticky;
+    top: 0;
+    z-index: 20;
+}
+
+.brand {
+    font-weight: 700;
+    font-size: 18px;
+    color: var(--accent);
+}
+
+.topbar-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.btn {
+    background: var(--panel-2);
+    color: var(--text);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 7px 12px;
+    cursor: pointer;
+    font-size: 13px;
+    transition: filter 0.15s;
+}
+
+.btn:hover {
+    filter: brightness(1.15);
+}
+
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+}
+
+.btn-primary {
+    background: var(--accent);
+    color: #1a1a1a;
+    border-color: var(--accent);
+    font-weight: 600;
+}
+
+.btn-small {
+    padding: 4px 8px;
+    font-size: 12px;
+}
+
+.btn-danger {
+    background: transparent;
+    border-color: var(--red);
+    color: var(--red);
+}
+
+.banner {
+    padding: 8px 16px;
+    background: var(--accent-2);
+    color: #fff;
+    font-size: 13px;
+}
+
+.layout {
+    display: flex;
+    height: calc(100vh - 53px);
+}
+
+.sidebar {
+    width: 260px;
+    min-width: 260px;
+    background: var(--panel);
+    border-right: 1px solid var(--border);
+    display: flex;
+    flex-direction: column;
+}
+
+.sidebar-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    font-weight: 600;
+}
+
+.cat-list {
+    overflow-y: auto;
+    flex: 1;
+}
+
+.cat-entry {
+    padding: 10px 12px;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+}
+
+.cat-entry:hover {
+    background: var(--panel-2);
+}
+
+.cat-entry.active {
+    background: var(--panel-2);
+    border-left: 3px solid var(--accent);
+}
+
+.cat-entry .cat-title {
+    font-weight: 600;
+    display: flex;
+    align-items: center;
+    gap: 7px;
+}
+
+.btn-market {
+    margin-left: auto;
+    flex: none;
+    white-space: nowrap;
+}
+
+.cat-entry .cat-sub {
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 2px;
+}
+
+.content {
+    flex: 1;
+    overflow: auto;
+    padding: 16px;
+}
+
+.empty {
+    color: var(--muted);
+    text-align: center;
+    margin-top: 80px;
+}
+
+.cat-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: flex-start;
+    gap: 16px;
+    margin-bottom: 16px;
+    flex-wrap: wrap;
+}
+
+.cat-head h2 {
+    margin: 0 0 6px;
+}
+
+.meta-line {
+    color: var(--muted);
+    font-size: 13px;
+    margin: 2px 0;
+}
+
+.meta-line a {
+    color: var(--accent-2);
+}
+
+.cat-head-actions {
+    display: flex;
+    gap: 8px;
+    flex-wrap: wrap;
+}
+
+.stats {
+    display: flex;
+    gap: 12px;
+    flex-wrap: wrap;
+    margin-bottom: 16px;
+}
+
+.stat-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 10px 14px;
+    min-width: 120px;
+}
+
+.stat-card .label {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.stat-card .value {
+    font-size: 18px;
+    font-weight: 700;
+    margin-top: 4px;
+}
+
+.table-wrap {
+    overflow-x: auto;
+    border: 1px solid var(--border);
+    border-radius: 10px;
+}
+
+table {
+    border-collapse: collapse;
+    width: 100%;
+    font-size: 12.5px;
+}
+
+/*
+ * Компактный режим таблицы кота,
+ * чтобы колонки помещались без горизонтального скролла.
+ */
+table.table-compact {
+    font-size: 11.5px;
+}
+
+table.table-compact th,
+table.table-compact td {
+    padding: 3px 5px;
+}
+
+table.table-compact input.cell-input {
+    width: 56px;
+    padding: 2px 4px;
+}
+
+table.table-compact .item-cell img {
+    width: 20px;
+    height: 20px;
+}
+
+table.table-compact .item-cell {
+    gap: 5px;
+}
+
+th.grp-head {
+    text-align: center;
+    letter-spacing: 0.4px;
+}
+
+.grp-sell {
+    background: rgba(52, 211, 153, 0.06);
+}
+
+.grp-buy {
+    background: rgba(59, 130, 246, 0.06);
+}
+
+.grp-total {
+    background: rgba(240, 180, 41, 0.06);
+}
+
+th.grp-buy,
+td.grp-buy,
+th.grp-total,
+td.grp-total {
+    border-left: 2px solid var(--border);
+}
+
+td.grp-item,
+th.grp-item {
+    max-width: 200px;
+}
+
+td.grp-item .item-cell span {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    max-width: 130px;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+td.grp-where {
+    max-width: 130px;
+    white-space: normal;
+    word-break: break-word;
+    text-align: left;
+}
+
+td.grp-where-price {
+    text-align: right;
+    white-space: nowrap;
+}
+
+/*
+ * Спиннер обновления: в списке котов и в строках базы товаров.
+ */
+.spin {
+    display: inline-block;
+    flex: none;
+    width: 11px;
+    height: 11px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+}
+
+@keyframes spin {
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+th, td {
+    padding: 6px 8px;
+    border-bottom: 1px solid var(--border);
+    text-align: right;
+    white-space: nowrap;
+}
+
+th {
+    background: var(--panel-2);
+    color: var(--muted);
+    font-weight: 600;
+    position: sticky;
+    top: 0;
+}
+
+th:first-child, td:first-child {
+    text-align: left;
+}
+
+tbody tr:hover {
+    background: rgba(255, 255, 255, 0.02);
+}
+
+.item-cell {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.item-cell img {
+    width: 28px;
+    height: 28px;
+    object-fit: contain;
+    background: #000;
+    border-radius: 4px;
+}
+
+.unconfigured {
+    color: var(--accent);
+}
+
+.pos {
+    color: var(--green);
+}
+
+.neg {
+    color: var(--red);
+}
+
+/*
+ * Приглушённый текст для нулевых значений
+ * (продано/куплено/докупить = 0, прибыль = 0).
+ */
+.muted-val {
+    color: var(--muted);
+    opacity: 0.55;
+}
+
+/* Убираем стрелочки вверх/вниз у number-инпутов. */
+input[type="number"]::-webkit-outer-spin-button,
+input[type="number"]::-webkit-inner-spin-button {
+    -webkit-appearance: none;
+    margin: 0;
+}
+
+input[type="number"] {
+    -moz-appearance: textfield;
+    appearance: textfield;
+}
+
+.breakdown-box {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 8px 10px;
+    margin: 6px 0 12px;
+    font-size: 12.5px;
+    line-height: 1.6;
+}
+
+td.breakdown-cell {
+    text-align: left;
+    white-space: normal;
+    max-width: 340px;
+    font-size: 12px;
+    line-height: 1.5;
+}
+
+/*
+ * База товаров: панель инструментов, рыночные цены, продавцы.
+ */
+.products-toolbar {
+    display: flex;
+    gap: 10px;
+    align-items: center;
+    flex-wrap: wrap;
+    margin-bottom: 10px;
+}
+
+.products-toolbar #product-search {
+    flex: 1;
+    min-width: 200px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.add-product {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+}
+
+.add-product input {
+    width: 120px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+td.gold-unit {
+    text-align: right;
+    white-space: nowrap;
+    color: var(--accent);
+}
+
+td.market-td {
+    text-align: left;
+    white-space: normal;
+    min-width: 240px;
+}
+
+.market-cell {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+}
+
+.market-line {
+    font-size: 12.5px;
+}
+
+.market-line b {
+    color: var(--accent);
+}
+
+.market-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 2px;
+}
+
+.suspicious {
+    margin-top: 4px;
+    padding: 4px 7px;
+    border-radius: 6px;
+    background: rgba(248, 113, 113, 0.12);
+    border: 1px solid var(--red);
+    color: var(--red);
+    font-size: 11.5px;
+}
+
+tr.sellers-row > td {
+    background: var(--bg);
+    text-align: left;
+    white-space: normal;
+    padding: 10px 12px;
+}
+
+.sellers-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+}
+
+.sellers-title {
+    font-weight: 600;
+    color: var(--muted);
+    margin-bottom: 6px;
+    font-size: 12px;
+}
+
+.offer-row {
+    display: flex;
+    gap: 8px;
+    align-items: baseline;
+    padding: 3px 0;
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    flex-wrap: wrap;
+}
+
+.offer-src {
+    flex: 0 0 auto;
+    padding: 1px 7px;
+    border-radius: 20px;
+    font-size: 10.5px;
+    border: 1px solid var(--border);
+}
+
+.offer-src.src-shop {
+    color: var(--green);
+    border-color: var(--green);
+}
+
+.offer-src.src-auction {
+    color: var(--accent-2);
+    border-color: var(--accent-2);
+}
+
+.offer-who {
+    font-weight: 600;
+}
+
+.offer-price {
+    color: var(--accent);
+    font-weight: 700;
+}
+
+.offer-count,
+.offer-where {
+    color: var(--muted);
+}
+
+input.cell-input {
+    width: 70px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 3px 6px;
+    text-align: right;
+}
+
+input.cell-input-wide {
+    width: 140px;
+    padding: 5px 8px;
+}
+
+.field input[type="search"] {
+    width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.modal-root {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.modal-backdrop {
+    position: absolute;
+    inset: 0;
+    background: rgba(0, 0, 0, 0.6);
+}
+
+.modal {
+    position: relative;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 18px;
+    width: min(920px, 92vw);
+    max-height: 86vh;
+    overflow: auto;
+}
+
+.modal-wide {
+    width: min(1400px, 96vw);
+}
+
+.modal h3 {
+    margin: 0 0 14px;
+}
+
+.field {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    margin-bottom: 12px;
+}
+
+.field label {
+    color: var(--muted);
+    font-size: 12px;
+}
+
+.field input {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 8px;
+    padding: 8px 10px;
+}
+
+.modal-actions {
+    display: flex;
+    gap: 8px;
+    justify-content: flex-end;
+    margin-top: 16px;
+}
+
+.grid-2 {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 12px;
+}
+
+.badge {
+    display: inline-block;
+    padding: 1px 7px;
+    border-radius: 20px;
+    font-size: 11px;
+    border: 1px solid var(--border);
+    color: var(--muted);
+}
+
+.badge.warn {
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+.badge.ok {
+    color: var(--green);
+    border-color: var(--green);
+}
+
+/*
+ * Статус кота: comeback отдаёт "Магазин не найден", когда кот убран.
+ */
+.cat-status {
+    flex: none;
+    margin-left: auto;
+    padding: 0 6px;
+    border-radius: 20px;
+    font-size: 10.5px;
+    font-weight: 600;
+    border: 1px solid var(--border);
+    color: var(--muted);
+}
+
+.cat-status.online {
+    color: var(--green);
+    border-color: var(--green);
+}
+
+.cat-status.offline {
+    color: var(--red);
+    border-color: var(--red);
+}
+
+.cat-entry .cat-money {
+    margin-top: 1px;
+}
+
+/*
+ * Баннер очереди: подпись слева, кнопка отмены справа.
+ */
+.banner {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+}
+
+.banner .btn {
+    background: rgba(0, 0, 0, 0.25);
+    border-color: rgba(255, 255, 255, 0.4);
+    color: #fff;
+}
+
+/*
+ * Статистика по дням под таблицей кота.
+ */
+.daily-box {
+    margin-top: 18px;
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 12px 14px;
+}
+
+.daily-box h3 {
+    margin: 0;
+    font-size: 15px;
+}
+
+.daily-head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+}
+
+.range-switch {
+    display: flex;
+    gap: 6px;
+}
+
+.daily-chart {
+    display: block;
+    width: 100%;
+    height: auto;
+    margin: 4px 0 6px;
+}
+
+.daily-chart .bar-pos {
+    fill: var(--green);
+}
+
+.daily-chart .bar-neg {
+    fill: var(--red);
+}
+
+.daily-chart .bar-zero {
+    fill: var(--border);
+}
+
+.daily-chart .axis {
+    stroke: var(--muted);
+    stroke-width: 1;
+    opacity: 0.5;
+}
+
+.daily-chart .tick {
+    fill: var(--muted);
+    font-size: 11px;
+}
