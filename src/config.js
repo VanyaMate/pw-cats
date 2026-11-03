@@ -19,15 +19,24 @@ const PROXY_URL =
 const proxyAgent =
     new HttpsProxyAgent(PROXY_URL);
 
+const USER_AGENT =
+    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36';
+
+/*
+ * maxRedirects: 0 и validateStatus до 400 нужны анти-боту comeback.pw:
+ * страница магазина отдаёт 302 на себя же, и по этому редиректу идёт
+ * настоящая витрина. Ошибки 4xx/5xx при этом остаются ошибками.
+ */
 const http = axios.create({
     httpAgent: proxyAgent,
     httpsAgent: proxyAgent,
     proxy: false,
     timeout: 30000,
+    maxRedirects: 0,
+    validateStatus: status => status >= 200 && status < 400,
 
     headers: {
-        'User-Agent':
-            'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/140 Safari/537.36',
+        'User-Agent': USER_AGENT,
 
         'Accept-Language':
             'ru-RU,ru;q=0.9,en-US;q=0.8,en;q=0.7'
@@ -38,5 +47,6 @@ module.exports = {
     PORT,
     DB_FILE,
     PROXY_URL,
+    USER_AGENT,
     http
 };

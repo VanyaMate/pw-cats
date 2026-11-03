@@ -1,13 +1,14 @@
 'use strict';
 
 const cheerio = require('cheerio');
-const { http } = require('./config');
+const { http, USER_AGENT } = require('./config');
 const {
     cleanText,
     parseCount,
     parsePrice,
     absoluteUrl,
-    buildShopUrl
+    buildShopUrl,
+    sleep
 } = require('./util');
 
 /*
@@ -178,10 +179,152 @@ function parseShopPage(html, pageUrl, side) {
     };
 }
 
-async function fetchHtml(url) {
-    const response = await http.get(url);
+/*
+ * Анти-бот comeback.pw (появился в ночь на 2026-11-03).
+ *
+ * Без cookies вместо витрины приходит заглушка: крутящийся GIF и скрипт,
+ * который берёт код из cookie __js_p_, считает по нему __jhash_ тем же
+ * циклом get_jhash, пишет __jua_ с юзер-агентом и перезагружает страницу.
+ * Сервер проверяет хэш, ставит __hash_ и делает 302 на этот же адрес —
+ * настоящая страница приходит только по этому редиректу.
+ *
+ * Набор cookie держим в памяти процесса: прогретая сессия отдаёт любую
+ * страницу магазина и рынка одним запросом, повторный челлендж не нужен.
+ */
 
-    return String(response.data || '');
+const CHALLENGE_MARKERS = [
+    'gorizontal-vertikal',
+    'get_jhash'
+];
+
+const CHALLENGE_ATTEMPTS = 6;
+
+const CHALLENGE_PAUSE_MS = 400;
+
+const cookies = new Map();
+
+function isChallengePage(html) {
+    return CHALLENGE_MARKERS.every(marker => html.includes(marker));
+}
+
+function rememberCookies(setCookieHeaders) {
+    for (const header of setCookieHeaders || []) {
+        const pair = String(header).split(';')[0];
+
+        const index = pair.indexOf('=');
+
+        if (index > 0) {
+            cookies.set(
+                pair.slice(0, index).trim(),
+                pair.slice(index + 1).trim()
+            );
+        }
+    }
+}
+
+function cookieHeader() {
+    return Array.from(cookies.entries())
+        .map(([name, value]) => name + '=' + value)
+        .join('; ');
+}
+
+/*
+ * Копия get_jhash со страницы-заглушки. Все операнды положительны и не
+ * превышают 2^31, поэтому побитовые операции в Node дают тот же
+ * результат, что в браузере.
+ */
+function solveJhash(code) {
+    let x = 123456789;
+    let k = 0;
+
+    for (let i = 0; i < 1677696; i++) {
+        x = ((x + code) ^ (x + (x % 3) + (x % 17) + code) ^ i) % 16776960;
+
+        if (x % 117 === 0) {
+            k = (k + 1) % 1111;
+        }
+    }
+
+    return k;
+}
+
+/*
+ * fixedEncodeURIComponent из того же скрипта: encodeURIComponent не
+ * трогает !'()* , а для cookie их экранируют вручную.
+ */
+function encodeUserAgent(value) {
+    return encodeURIComponent(value).replace(
+        /[!'()*]/g,
+        character =>
+            '%' + character.charCodeAt(0).toString(16)
+    );
+}
+
+/*
+ * Пройти челлендж: посчитать __jhash_ по актуальному __js_p_.
+ * Возвращает false, если сервер не выдал код — дальше дергаться бессмысленно.
+ */
+function solveChallenge() {
+    const parts = cleanText(cookies.get('__js_p_') || '').split(',');
+
+    const code = Number(parts[0]);
+
+    if (!parts[0] || !Number.isInteger(code)) {
+        return false;
+    }
+
+    cookies.set('__jhash_', String(solveJhash(code)));
+    cookies.set('__jua_', encodeUserAgent(USER_AGENT));
+
+    return true;
+}
+
+/*
+ * Забрать HTML страницы, при необходимости пройдя анти-бот.
+ * Бросает ошибку, если comeback так и не отдал страницу: молчаливый
+ * пустой разбор раньше прятал проблему — коты оставались «онлайн» без
+ * товаров.
+ */
+async function fetchHtml(url) {
+    let target = url;
+
+    for (let attempt = 1; attempt <= CHALLENGE_ATTEMPTS; attempt++) {
+        const response = await http.get(target, {
+            headers: {
+                Cookie: cookieHeader(),
+                Referer: url
+            }
+        });
+
+        rememberCookies(response.headers['set-cookie']);
+
+        const html = String(response.data || '');
+
+        const redirected =
+            response.status >= 300 && response.status < 400 &&
+            response.headers.location;
+
+        if (html && !isChallengePage(html)) {
+            return html;
+        }
+
+        if (redirected) {
+            target = absoluteUrl(response.headers.location, target);
+
+            continue;
+        }
+
+        if (!solveChallenge()) {
+            break;
+        }
+
+        await sleep(CHALLENGE_PAUSE_MS);
+    }
+
+    throw new Error(
+        'comeback.pw не отдал страницу: не пройдена проверка ' +
+        'анти-бота (' + url + ')'
+    );
 }
 
 /*
@@ -357,5 +500,7 @@ module.exports = {
     parseShopPage,
     parseMarketPage,
     fetchHtml,
-    fetchShop
+    fetchShop,
+    isChallengePage,
+    solveJhash
 };
