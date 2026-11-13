@@ -6,7 +6,11 @@ const { HttpsProxyAgent } = require('https-proxy-agent');
 
 const PORT = Number(process.env.PORT) || 3030;
 
-const DB_FILE = path.join(
+/*
+ * Файл базы можно подменить через DB_FILE — нужно для прогонов на
+ * копии данных, чтобы не трогать рабочую базу.
+ */
+const DB_FILE = process.env.DB_FILE || path.join(
     __dirname,
     '..',
     'pw-cats.json'

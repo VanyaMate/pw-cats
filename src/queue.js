@@ -201,6 +201,15 @@ function cancel() {
     return { removed, current: current ? current.id : null };
 }
 
+/*
+ * Сколько задач ещё ждут своей очереди (текущая в работе не считается:
+ * она уже выбрана из очереди). Нужно заданиям вроде «переноса цен»,
+ * которые обязаны идти строго после всех обновлений.
+ */
+function pendingCount() {
+    return queue.length;
+}
+
 function status() {
     return {
         running: workerRunning,
@@ -226,5 +235,6 @@ module.exports = {
     enqueue,
     enqueueIfAbsent,
     cancel,
+    pendingCount,
     status
 };

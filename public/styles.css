@@ -577,6 +577,70 @@ input.cell-input-wide {
     padding: 5px 8px;
 }
 
+/*
+ * Выбор источника докупки в строке кота: компактный селект, подпись,
+ * чем он разрешается, и поле ручной цены.
+ */
+select.cell-select {
+    width: 128px;
+    max-width: 100%;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 2px 4px;
+    font-size: 12px;
+}
+
+.src-price-input {
+    display: block;
+    width: 96px;
+    margin-top: 3px;
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text);
+    border-radius: 6px;
+    padding: 2px 4px;
+    font-size: 12px;
+    text-align: right;
+}
+
+.src-note {
+    color: var(--muted);
+    font-size: 11px;
+    white-space: normal;
+}
+
+/*
+ * Ячейка цены в базе товаров: ручная строка сверху, автоматическая
+ * снизу; активная (та, что идёт в расчёты) подсвечивается.
+ */
+td.price-cell {
+    white-space: normal;
+}
+
+.auto-line {
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 2px;
+    white-space: nowrap;
+}
+
+.price-used {
+    color: var(--text);
+    font-weight: 600;
+}
+
+.badge.own {
+    color: var(--muted);
+    border-style: dashed;
+}
+
+.offer-anomaly .offer-price {
+    color: var(--muted);
+    text-decoration: line-through;
+}
+
 .field input[type="search"] {
     width: 100%;
     background: var(--bg);

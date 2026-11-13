@@ -427,6 +427,8 @@ function renderCat(cat) {
         (cat.updating ? 'Обновление…' : 'Обновить') + '</button>' +
         '<button class="btn" data-act="update-front" ' +
         'title="Поставить в начало очереди — обновится сразу после текущей задачи">Обновить сразу</button>' +
+        '<button class="btn" data-act="product-prices" ' +
+        'title="Обновить рыночные цены всех товаров этого кота (задания встанут в общую очередь)">Цены товаров</button>' +
         '<button class="btn" data-act="carry">Перенос</button>' +
         '<button class="btn" data-act="stats">Статистика</button>' +
         '<button class="btn" data-act="reset">Сброс</button>' +
@@ -537,10 +539,31 @@ function renderItemRow(cat, item) {
     const needClass = item.needToBuy > 0 ? '' : ' muted-val';
     const profitClass = profitColorClass(item.profit);
 
-    // Место и цена самой дешёвой докупки (скуп или магазин за голду).
+    /*
+     * Если товар стоит у кота и в скупе, и в продаже, купленное в
+     * собственном скупе идёт в тот же запас и снаружи докупать его не
+     * нужно. Показываем зачёт подписью под цифрой, чтобы "докупить"
+     * не выглядело потерянным объёмом.
+     */
+    const covered = item.coveredByBuy > 0
+        ? '<div class="src-note">своим скупе: ' +
+            quantity(item.coveredByBuy) + '</div>'
+        : '';
+
+    const needCell =
+        '<td class="grp-total' + needClass + '">' +
+        quantity(item.needToBuy) + covered + '</td>';
+
+    // Место и цена докупки: закрепленное место или самый дешёвый источник.
     const wherePrice = item.bestBuyPrice > 0
         ? money(item.bestBuyPrice)
         : '<span class="muted-val">—</span>';
+
+    const whereCell =
+        '<td class="grp-total grp-where">' +
+        buySourceSelect(cat, item) +
+        '<div class="src-note">' + escapeHtml(item.bestBuyLabel) + '</div>' +
+        '</td>';
 
     return (
         '<tr>' +
@@ -555,12 +578,70 @@ function renderItemRow(cat, item) {
         '<td class="grp-buy' + boughtClass + '">' + quantity(item.bought) + '</td>' +
         '<td class="grp-buy">' + money(item.buyPrice) + '</td>' +
         '<td class="grp-buy">' + money(item.recommendedBuy) + '</td>' +
-        '<td class="grp-total' + needClass + '">' + quantity(item.needToBuy) + '</td>' +
-        '<td class="grp-total grp-where">' + escapeHtml(item.bestBuyLabel) + '</td>' +
+        needCell +
+        whereCell +
         '<td class="grp-total grp-where-price">' + wherePrice + '</td>' +
         '<td class="grp-total ' + profitClass + '">' + money(item.profit) + '</td>' +
         '<td class="grp-total ' + profitClass + '">' + money(item.profitPerSale) + '</td>' +
         '</tr>'
+    );
+}
+
+/*
+ * Выбор источника докупки для позиции. Значение — 'auto', 'gold',
+ * 'manual' или 'cat:<id>'; цена вручную доезжает отдельным полем.
+ */
+function buySourceSelect(cat, item) {
+    const source = item.buySource || { type: 'auto' };
+
+    const value =
+        source.type === 'cat'
+            ? 'cat:' + source.catId
+            : source.type === 'gold' || source.type === 'manual' || source.type === 'market'
+                ? source.type
+                : 'auto';
+
+    const cats = [...state.cats].sort((a, b) =>
+        String(a.name || a.shopName || '').localeCompare(
+            String(b.name || b.shopName || ''),
+            'ru'
+        )
+    );
+
+    const options = ['<option value="auto">Авто (дешевле всего)</option>'];
+
+    for (const other of cats) {
+        const label =
+            'Скуп: ' + (other.name || other.shopName || 'кот') +
+            (other.id === cat.id ? ' (этот кот)' : '');
+
+        options.push(
+            '<option value="cat:' + escapeHtml(other.id) + '"' +
+            (value === 'cat:' + other.id ? ' selected' : '') + '>' +
+            escapeHtml(label) + '</option>'
+        );
+    }
+
+    options.push(
+        '<option value="market"' + (value === 'market' ? ' selected' : '') +
+        '>Быстрая покупка (рынок)</option>',
+        '<option value="gold"' + (value === 'gold' ? ' selected' : '') +
+        '>Магазин (голда)</option>',
+        '<option value="manual"' + (value === 'manual' ? ' selected' : '') +
+        '>Цена вручную</option>'
+    );
+
+    const priceInput = value === 'manual'
+        ? '<input class="src-price-input" type="number" min="0" step="1" ' +
+            'placeholder="цена" ' +
+            'data-product="' + item.productId + '" ' +
+            'value="' + (source.price || '') + '" />'
+        : '';
+
+    return (
+        '<select class="cell-select" data-product="' + item.productId + '">' +
+        options.join('') +
+        '</select>' + priceInput
     );
 }
 
@@ -818,6 +899,8 @@ function bindCatEvents(cat) {
                     updateCurrentCat(cat, true);
                 } else if (action === 'carry') {
                     carryCurrentCat(cat);
+                } else if (action === 'product-prices') {
+                    updateCatProductPrices(cat);
                 } else if (action === 'stats') {
                     openCatStats(cat);
                 } else if (action === 'reset') {
@@ -845,6 +928,31 @@ function bindCatEvents(cat) {
             });
         });
 
+    content
+        .querySelectorAll('select.cell-select')
+        .forEach(select => {
+            select.addEventListener('change', () => {
+                saveBuySource(
+                    cat.id,
+                    select.getAttribute('data-product'),
+                    select.value
+                );
+            });
+        });
+
+    content
+        .querySelectorAll('input.src-price-input')
+        .forEach(input => {
+            input.addEventListener('change', () => {
+                saveBuySource(
+                    cat.id,
+                    input.getAttribute('data-product'),
+                    'manual',
+                    input.value
+                );
+            });
+        });
+
     bindDailyControls(cat.id);
 }
 
@@ -865,6 +973,62 @@ async function updateCatItem(catId, productId, field, value) {
         // Итоги кота видны и в списке слева — обновляем оба.
         renderCatList();
         renderContent();
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+/*
+ * Сохранить источник докупки позиции. 'auto' шлём как null — так на
+ * сервере хранится «ничего не закреплено».
+ */
+async function saveBuySource(catId, productId, value, manualPrice) {
+    let buySource = null;
+
+    if (value === 'gold') {
+        buySource = { type: 'gold' };
+    } else if (value === 'market') {
+        buySource = { type: 'market' };
+    } else if (value === 'manual') {
+        buySource = { type: 'manual', price: Number(manualPrice) || 0 };
+    } else if (value.indexOf('cat:') === 0) {
+        buySource = { type: 'cat', catId: value.slice(4) };
+    }
+
+    try {
+        const updated = await api(
+            'PUT',
+            '/api/cats/' + catId + '/items/' + productId,
+            { buySource }
+        );
+
+        const index = state.cats.findIndex(c => c.id === catId);
+
+        if (index !== -1) {
+            state.cats[index] = updated;
+        }
+
+        renderCatList();
+        renderContent();
+    } catch (error) {
+        alert(error.message);
+    }
+}
+
+/*
+ * Цены товаров этого кота: ставим в общую очередь одну задачу, она
+ * сама расставит задания рынка по строкам кота.
+ */
+async function updateCatProductPrices(cat) {
+    if (!cat.items || cat.items.length === 0) {
+        alert('У кота нет товаров.');
+        return;
+    }
+
+    try {
+        await api('POST', '/api/cats/' + cat.id + '/update-product-prices');
+
+        startQueuePolling();
     } catch (error) {
         alert(error.message);
     }
@@ -1347,14 +1511,22 @@ function renderOffersList(offers, side) {
                           : '');
 
             return (
-                '<div class="offer-row">' +
+                '<div class="offer-row' +
+                (offer.anomaly ? ' offer-anomaly' : '') + '">' +
                 '<span class="offer-src src-' + offer.source + '">' +
                 sourceLabel(offer.source) + '</span>' +
                 '<span class="offer-who">' + escapeHtml(who) +
                 (offer.shopName && offer.nick
                     ? ' <span class="muted-val">· ' + escapeHtml(offer.shopName) + '</span>'
+                    : '') +
+                (offer.own
+                    ? ' <span class="badge own" title="Это ваша же витрина: в расчёт рыночной цены не берётся">свой кот</span>'
                     : '') + '</span>' +
-                '<span class="offer-price">' + money(price) + '</span>' +
+                '<span class="offer-price">' + money(price) +
+                (offer.anomaly
+                    ? ' <span class="badge warn" title="Мелкий объём по цене сильно выше кластера - в расчёт рыночной цены не берётся">всплеск</span>'
+                    : '') +
+                '</span>' +
                 '<span class="offer-count">×' + quantity(offer.count) + '</span>' +
                 '<span class="offer-where">' + escapeHtml(where) + '</span>' +
                 '</div>'
@@ -1373,12 +1545,12 @@ function renderSellersDetail(product) {
     return (
         '<div class="sellers-grid">' +
         '<div class="sellers-col">' +
-        '<div class="sellers-title">Продают (дешевле сверху)</div>' +
-        renderOffersList(market.sellOffers, 'sell') +
-        '</div>' +
-        '<div class="sellers-col">' +
         '<div class="sellers-title">Покупают (дороже сверху)</div>' +
         renderOffersList(market.buyOffers, 'buy') +
+        '</div>' +
+        '<div class="sellers-col">' +
+        '<div class="sellers-title">Продают (дешевле сверху)</div>' +
+        renderOffersList(market.sellOffers, 'sell') +
         '</div>' +
         '</div>' +
         '<div class="muted-val" style="margin-top:6px">Сервер ' +
@@ -1408,21 +1580,30 @@ function renderMarketCell(product) {
         );
     }
 
-    const suspicious = market.suspicious
-        ? '<div class="suspicious">⚠ цена резко изменилась: ' +
-          money(market.previousSellPrice) + ' → ' +
-          money(market.suspiciousSellPrice) +
-          ' · товар снова в очереди</div>'
+    const jump = market.jump
+        ? '<div class="suspicious">⚠ цена продажи резко изменилась: ' +
+          money(market.jump.from) + ' → ' + money(market.jump.to) +
+          ' · новая принята сразу</div>'
+        : '';
+
+    const skip = product.carrySkip || {};
+
+    const skipNote = side => skip[side]
+        ? '<div class="badge warn" title="Перенос пропущен: новая цена отличается от ручной больше чем на порог отклонения из Настроек">' +
+          'скачок ' + money(skip[side].from) + ' → ' + money(skip[side].to) +
+          '</div>'
         : '';
 
     return (
         '<div class="market-cell">' +
-        '<div class="market-line">продажа: <b>' + money(market.sellPrice) + '</b> ' +
-        '<button class="btn btn-small" data-act="apply" data-side="sell" data-p="' + pid + '">перенести</button></div>' +
         '<div class="market-line">покупка: <b>' + money(market.buyPrice) + '</b> ' +
-        '<button class="btn btn-small" data-act="apply" data-side="buy" data-p="' + pid + '">перенести</button></div>' +
+        '<button class="btn btn-small" data-act="apply" data-side="buy" data-p="' + pid + '">перенести</button>' +
+        skipNote('buy') + '</div>' +
+        '<div class="market-line">продажа: <b>' + money(market.sellPrice) + '</b> ' +
+        '<button class="btn btn-small" data-act="apply" data-side="sell" data-p="' + pid + '">перенести</button>' +
+        skipNote('sell') + '</div>' +
         buttons +
-        suspicious +
+        jump +
         '</div>'
     );
 }
@@ -1489,16 +1670,44 @@ function openProducts() {
                 ? '<span class="badge ok">настроен</span>'
                 : '<span class="badge warn">не настроен</span>';
 
-            const input = (field, value) =>
-                '<td><input class="cell-input cell-input-wide" type="number" min="0" ' +
-                'step="any" data-p="' + product.id + '" data-f="' + field +
-                '" value="' + (value || 0) + '" /></td>';
+            /*
+             * Ячейка цены в две строки: сверху ручная цена (она и
+             * участвует в расчётах, если задана), снизу автоматическая
+             * цена с рынка — только чтение.
+             */
+            const priceCell = (field, auto) => {
+                const manual = Number(product[field]) || 0;
+
+                const autoLine = auto > 0
+                    ? 'авто ' + money(auto)
+                    : '<span class="muted-val">авто нет</span>';
+
+                return (
+                    '<td class="price-cell">' +
+                    '<input class="cell-input cell-input-wide' +
+                    (manual > 0 ? ' price-used' : '') + '" type="number" min="0" ' +
+                    'step="any" data-p="' + product.id + '" data-f="' + field +
+                    '" value="' + manual + '" ' +
+                    'title="Ручная цена: если задана, используется она" />' +
+                    '<div class="auto-line' + (manual > 0 ? '' : ' price-used') + '" ' +
+                    'title="Автоматическая цена с рынка, обновляется кнопкой цен">' +
+                    autoLine + '</div>' +
+                    '</td>'
+                );
+            };
 
             const expanded = productsUI.expanded.has(product.id);
 
             const goldUnit = product.goldUnitPrice > 0
                 ? money(product.goldUnitPrice)
                 : '<span class="muted-val">—</span>';
+
+            const market = product.market || {};
+
+            const input = (field, value) =>
+                '<td><input class="cell-input cell-input-wide" type="number" min="0" ' +
+                'step="any" data-p="' + product.id + '" data-f="' + field +
+                '" value="' + (value || 0) + '" /></td>';
 
             const mainRow =
                 '<tr data-name="' + escapeHtml(product.name.toLowerCase()) + '" data-pid="' + product.id + '">' +
@@ -1509,8 +1718,8 @@ function openProducts() {
                     : '') +
                 '<span>' + escapeHtml(product.name) + '</span> ' + badge +
                 '</div></td>' +
-                input('buyPrice', product.buyPrice) +
-                input('sellPrice', product.sellPrice) +
+                priceCell('buyPrice', Number(market.buyPrice) || 0) +
+                priceCell('sellPrice', Number(market.sellPrice) || 0) +
                 input('goldShopPrice', product.goldShopPrice) +
                 input('goldShopAmount', product.goldShopAmount) +
                 '<td class="gold-unit" data-gold-unit="' + product.id + '">' + goldUnit + '</td>' +
@@ -1537,15 +1746,20 @@ function openProducts() {
         '<button class="btn" id="add-product-btn">Добавить по ID</button>' +
         '</div>' +
         '<button class="btn" id="update-all-prices">Обновить цены всех</button>' +
+        '<button class="btn" id="update-all-prices-carry" ' +
+        'title="Обновить рынок всех товаров, а когда очередь дойдёт до конца — перенести рыночные цены скупа и продажи в ручные. Всплески предложений уже отсеяны; скачки относительно ручной цены пропускаются и помечаются">Обновить и перенести цены всех</button>' +
         '</div>' +
-        '<p class="meta-line">Цена скупа и цена продажи — в игровом золоте. ' +
-        '«Цена в шопе» — в голде за партию, «Кол-во за цену» — сколько штук за эту цену. ' +
-        'Курс голды задаётся в Настройках. «Цена за шт (из голды)» считается сама: ' +
-        'курс голды × цена в шопе / кол-во. Рыночная цена берётся с comeback.pw ' +
-        '(продавцы/покупатели: коты, комиссионка, аукцион) — её можно перенести в ручную.</p>' +
+        '<p class="meta-line">Каждая цена в две строки: сверху ручная (если ' +
+        'заполнена, расчёты используют её), снизу автоматическая с рынка ' +
+        '(только чтение, обновляется кнопками цен). Цена покупки стоит слева, ' +
+        'она обычно больше цены продажи. «Цена в шопе» — в голде за партию, ' +
+        '«Кол-во за цену» — сколько штук за эту цену, «Цена за шт (из голды)» ' +
+        'считается сама: курс голды × цена в шопе / кол-во. Курс голды ' +
+        'задаётся в Настройках. В списке продавцов и покупателей метка ' +
+        '«свой кот» — это ваша витрина, её цена в рынок не входит.</p>' +
         '<div class="table-wrap"><table>' +
         '<thead><tr>' +
-        '<th>Товар</th><th>Цена скупа</th><th>Цена продажи</th>' +
+        '<th>Товар</th><th>Цена покупки</th><th>Цена продажи</th>' +
         '<th>Цена в шопе (голда)</th><th>Кол-во за цену</th>' +
         '<th>Цена за шт (из голды)</th><th>Рынок</th>' +
         '</tr></thead>' +
@@ -1611,6 +1825,32 @@ function bindProductsEvents() {
     document.getElementById('update-all-prices').addEventListener('click', async () => {
         try {
             await api('POST', '/api/products/update-all-prices');
+            startQueuePolling();
+        } catch (error) {
+            alert(error.message);
+        }
+    });
+
+    document.getElementById('update-all-prices-carry').addEventListener('click', async () => {
+        if (state.products.length === 0) {
+            alert('Нет товаров для обновления.');
+            return;
+        }
+
+        if (
+            !confirm(
+                'Обновить рынок всех товаров, а когда очередь дойдёт до конца — ' +
+                'перенести рыночные цены скупа и продажи в ручные поля? ' +
+                'Цены с резким скачком относительно ручной будут пропущены и помечены.'
+            )
+        ) {
+            return;
+        }
+
+        try {
+            await api('POST', '/api/products/update-all-prices-carry');
+
+            // Перенос — последнее задание очереди, ждём её опросом.
             startQueuePolling();
         } catch (error) {
             alert(error.message);

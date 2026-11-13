@@ -12,6 +12,37 @@ const {
 } = require('./util');
 
 /*
+ * Цена в тултипе плитки: "Цена: 1,190,000 (79,730,000)".
+ *
+ * Первая цифра — цена за штуку так, как её показывает игра, вторая —
+ * сумма за партию (первая умноженная на количество). data-price у той
+ * же плитки отличается: на продаже он в 1.02-1.13 раза больше, в скупе
+ * в 0.88-0.98 раза меньше, то есть содержит комиссию сайта. Игровую
+ * цену берём из тултипа, data-price остаётся запасным вариантом на
+ * случай, если описания у плитки нет.
+ *
+ * При quantity = 1 скобок в тултипе нет, там только цена за штуку.
+ */
+function parseTooltipPrice(descHtml) {
+    const empty = { unit: 0, total: 0 };
+
+    if (!descHtml) {
+        return empty;
+    }
+
+    const text = cleanText(
+        cheerio.load(descHtml)('.info_item_value').first().text()
+    );
+
+    const numbers = text.match(/[\d][\d.,\s]*/g) || [];
+
+    return {
+        unit: parsePrice(numbers[0]),
+        total: parsePrice(numbers[1])
+    };
+}
+
+/*
  * Разбор одной страницы магазина.
  *
  * Товары лежат в витрине кота:
@@ -39,6 +70,8 @@ function parseShopPage(html, pageUrl, side) {
             return;
         }
 
+        const tooltip = parseTooltipPrice(node.attr('data-desc'));
+
         items.push({
             externalId,
 
@@ -48,7 +81,7 @@ function parseShopPage(html, pageUrl, side) {
 
             count: parseCount(node.attr('data-count')),
 
-            price: parsePrice(node.attr('data-price')),
+            price: tooltip.unit || parsePrice(node.attr('data-price')),
 
             image: absoluteUrl(node.attr('src') || '', pageUrl),
 
@@ -392,13 +425,31 @@ function parseMarketPage(html, pageUrl) {
             }
         }
 
-        const sellPrice =
-            parsePrice(node.find('.sell_search').first().text()) ||
-            parsePrice(icon.attr('data-price'));
+        /*
+         * Цены плитки: .sell_search и .buy_search — цифры сайта с
+         * комиссией, тултип — игровая цена. Сторона определяется по
+         * тому, какой блок непустой: на странице продавцов заполнен
+         * sell_search, на странице покупателей — buy_search.
+         */
+        const siteSellPrice = parsePrice(
+            node.find('.sell_search').first().text()
+        );
 
-        const buyPrice = parsePrice(
+        const siteBuyPrice = parsePrice(
             node.find('.buy_search').first().text()
         );
+
+        const tooltip = parseTooltipPrice(icon.attr('data-desc'));
+
+        const sellPrice = siteSellPrice > 0
+            ? (tooltip.unit ||
+                siteSellPrice ||
+                parsePrice(icon.attr('data-price')))
+            : 0;
+
+        const buyPrice = siteBuyPrice > 0
+            ? (tooltip.unit || siteBuyPrice)
+            : 0;
 
         const count =
             parseCount(node.find('.item-count').first().text()) ||
@@ -499,6 +550,7 @@ async function fetchShop(baseUrl, show) {
 module.exports = {
     parseShopPage,
     parseMarketPage,
+    parseTooltipPrice,
     fetchHtml,
     fetchShop,
     isChallengePage,

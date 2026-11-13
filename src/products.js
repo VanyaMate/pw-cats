@@ -78,6 +78,39 @@ function effectiveGoldPrice(product) {
 }
 
 /*
+ * Две цены у товара.
+ *
+ * Автоматическая — с рынка (market.buyPrice и market.sellPrice),
+ * пишется обновлением цен и всегда актуальна. Ручная — то, что вбил
+ * сам в базе товаров. Там, где нужна цена действия, приоритет у ручной:
+ * авто только подсказывает, если ручной нет.
+ */
+function autoBuyPrice(product) {
+    return toNumber(product.market && product.market.buyPrice);
+}
+
+function autoSellPrice(product) {
+    return toNumber(product.market && product.market.sellPrice);
+}
+
+function effectiveBuyPrice(product) {
+    return toNumber(product.buyPrice) || autoBuyPrice(product);
+}
+
+function effectiveSellPrice(product) {
+    return toNumber(product.sellPrice) || autoSellPrice(product);
+}
+
+/*
+ * «Быстрая покупка»: сколько стоит забрать товар у рынка прямо сейчас,
+ * то есть цена продажи, по которой его выставляют другие. Свои коты и
+ * всплески из этой цифры уже исключены на сборе рынка.
+ */
+function quickBuyPrice(product) {
+    return autoSellPrice(product);
+}
+
+/*
  * Цена одной штуки товара в игровом золоте,
  * если покупать её в магазине за голду.
  *
@@ -104,18 +137,29 @@ function shopUnitPrice(product) {
 /*
  * Рекомендованная цена.
  *
- * sell: ручная цена продажи -> цена из магазина за голду -> последняя из парсера
- * buy:  минимум из (ручная цена скупа, цена из магазина за голду)
- *       -> если ничего не задано, последняя из парсера
+ * Порядок один для обеих сторон: ручная цена -> автоматическая с рынка
+ * -> магазин за голду -> последняя цена из парсера витрины.
+ * Для покупки среди доступных берётся минимальная: что дешевле, тем и
+ * пользуемся в подсказках.
  */
 function getRecommendedPrice(product, side) {
     const shop = shopUnitPrice(product);
 
-    if (side === 'sell') {
-        const manualSell = toNumber(product.sellPrice);
+    const manual = toNumber(
+        side === 'buy' ? product.buyPrice : product.sellPrice
+    );
 
-        if (manualSell > 0) {
-            return manualSell;
+    const auto = side === 'buy'
+        ? autoBuyPrice(product)
+        : autoSellPrice(product);
+
+    if (side === 'sell') {
+        if (manual > 0) {
+            return manual;
+        }
+
+        if (auto > 0) {
+            return auto;
         }
 
         if (shop > 0) {
@@ -125,9 +169,7 @@ function getRecommendedPrice(product, side) {
         return toNumber(product.lastSellPrice);
     }
 
-    const manualBuy = toNumber(product.buyPrice);
-
-    const candidates = [manualBuy, shop].filter(value => value > 0);
+    const candidates = [manual, auto, shop].filter(value => value > 0);
 
     if (candidates.length) {
         return Math.min(...candidates);
@@ -142,11 +184,13 @@ function getRecommendedPrice(product, side) {
  * Сравниваем места и берём самое дешёвое:
  *
  * 1. Магазин за голду: цена партии в голде / количество × курс голды.
- * 2. Скуп у котов — коты, которые покупают этот товар у игроков
+ * 2. Быстрая покупка: забрать товар у рынка по его цене продажи.
+ * 3. Скуп у котов — коты, которые покупают этот товар у игроков
  *    (включая самого кота, для которого считается позиция). Цена скупа —
  *    item.buyPrice, для текущего кота дополнительно fallback на
  *    lastBuyPrice из парсера.
- * 3. Скуп из базы товаров — ручная цена скупа product.buyPrice.
+ * 4. Скуп из базы товаров — ручная цена скупа, а если её нет, то
+ *    автоматическая цена покупки с рынка.
  *
  * При равных ценах остаётся уже выбранный вариант: голда проверяется
  * первой, и именно она выигрывает равенство (запас там не кончается).
@@ -163,6 +207,18 @@ function bestBuySource(product, currentCatId) {
             type: 'gold',
             label: 'Магазин (голда)',
             price: shop,
+            available: Infinity,
+            catId: null
+        };
+    }
+
+    const quick = quickBuyPrice(product);
+
+    if (quick > 0 && quick < priceOf(best)) {
+        best = {
+            type: 'market',
+            label: 'Быстрая покупка (рынок)',
+            price: quick,
             available: Infinity,
             catId: null
         };
@@ -205,12 +261,14 @@ function bestBuySource(product, currentCatId) {
         }
     }
 
-    const fromBase = toNumber(product.buyPrice);
+    const fromBase = effectiveBuyPrice(product);
 
     if (fromBase > 0 && fromBase < priceOf(best)) {
         best = {
             type: 'base',
-            label: 'Скуп (из базы)',
+            label: toNumber(product.buyPrice) > 0
+                ? 'Скуп (из базы)'
+                : 'Скуп (рынок, авто)',
             price: fromBase,
             available: 0,
             catId: null
@@ -231,5 +289,10 @@ module.exports = {
     getRecommendedPrice,
     bestBuySource,
     effectiveGoldPrice,
-    shopUnitPrice
+    shopUnitPrice,
+    autoBuyPrice,
+    autoSellPrice,
+    effectiveBuyPrice,
+    effectiveSellPrice,
+    quickBuyPrice
 };

@@ -2,7 +2,7 @@
 
 const { db, save } = require('./db');
 const { fetchShop } = require('./parser');
-const { getOrCreateProduct } = require('./products');
+const { getOrCreateProduct, findProductById } = require('./products');
 const { getOrCreateCatItem } = require('./calculate');
 const { makeSnapshot, compareSnapshots } = require('./history');
 const { createId, now, sleep } = require('./util');
@@ -58,6 +58,44 @@ async function updateCat(cat) {
             catItem.lastBuyUpdate = now();
 
             product.lastBuyPrice = buyItem.price;
+        }
+    }
+
+    /*
+     * Раскупленные позиции. Товар, который весь разошёлся (или который кот
+     * выкупил в скупе), из сетки магазина исчезает, и на страницы он больше
+     * не попадает. Без этого прохода строка навсегда замирала на последней
+     * виденной цифре: sold = target - current давал ноль, и прибыль по коту
+     * оказывалась заниженной (на a020 так прятались три позиции).
+     *
+     * Цену не трогаем — другой цены, чем последняя известная, у нас нет.
+     * Если магазин отдал "Магазин не найден" (кот убран), витрина не видна
+     * целиком, обнулять не по чему — такие строки остаются как есть.
+     */
+    const sellSeen = !(sell.meta || {}).shopNotFound;
+    const buySeen = !(buy.meta || {}).shopNotFound;
+
+    for (const catItem of cat.items) {
+        const product = findProductById(catItem.productId);
+
+        if (!product) {
+            continue;
+        }
+
+        const externalId = product.externalId;
+
+        if (sellSeen && !sellMap.has(externalId)) {
+            if (catItem.sellCurrent !== 0) {
+                catItem.sellCurrent = 0;
+                catItem.lastSellUpdate = now();
+            }
+        }
+
+        if (buySeen && !buyMap.has(externalId)) {
+            if (catItem.buyCurrent !== 0) {
+                catItem.buyCurrent = 0;
+                catItem.lastBuyUpdate = now();
+            }
         }
     }
 

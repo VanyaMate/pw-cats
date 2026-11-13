@@ -23,18 +23,197 @@ function buildMarketUrl(externalId, show, server) {
 }
 
 /*
+ * Отсеиваем всплески в предложениях.
+ *
+ * Пример скупа: 4419 по 1000, 1000 по 1022, 996 по 1021 и одна сотня
+ * по 2000. Дорогие мелкие заявки — не цена рынка: по ним товар реально
+ * не выкупить, а при выборе цены они перебивают нормальный кластер.
+ *
+ * Кластер строим по объёму: берём предложения по убыванию количества,
+ * пока они не покроют 80% суммарного объёма. Лучшая цена кластера —
+ * максимальная для скупа и минимальная для продажи. Предложение
+ * считается всплеском, если оно хуже кластера больше чем на 15% и при
+ * этом меньше 25% медианного объёма кластера.
+ *
+ * В списке предложений всплеск остаётся с пометкой: его видно, но в
+ * цену он не входит.
+ */
+
+const CLUSTER_COVERAGE = 0.8;
+
+const ANOMALY_PRICE_GAP = 0.15;
+
+const ANOMALY_VOLUME_SHARE = 0.25;
+
+function offerPrice(offer, side) {
+    return side === 'buy'
+        ? toNumber(offer.buyPrice)
+        : toNumber(offer.sellPrice);
+}
+
+/*
+ * Магазины, которые принадлежат нашим же котам: id магазина берём из
+ * ссылки кота (параметр shop=), он же приходит в предложении рынка.
+ * Свой витриной рынок не бывает — свои предложения показывают, сколько
+ * просим мы, а не сколько стоит товар у людей, поэтому в цену они не
+ * входят, но остаются в списке с пометкой.
+ */
+function ownShopIds() {
+    const ids = new Set();
+
+    for (const cat of db.cats) {
+        const match = /shop=(\d+)/.exec(cat.url || '');
+
+        if (match) {
+            ids.add(match[1]);
+        }
+    }
+
+    return ids;
+}
+
+function markOwnOffers(offers, ids) {
+    for (const offer of offers) {
+        offer.own = ids.has(String(offer.id));
+    }
+
+    return offers;
+}
+
+/*
+ * Предложения, по которым считаем рынок: чужие и с непустой ценой.
+ */
+function pricePool(offers, side) {
+    return offers.filter(
+        offer => !offer.own && offerPrice(offer, side) > 0
+    );
+}
+
+function median(values) {
+    const sorted = [...values].sort((a, b) => a - b);
+
+    if (!sorted.length) {
+        return 0;
+    }
+
+    const middle = Math.floor(sorted.length / 2);
+
+    return sorted.length % 2
+        ? sorted[middle]
+        : (sorted[middle - 1] + sorted[middle]) / 2;
+}
+
+/*
+ * Помечает всплески прямо в массиве предложений, чтобы фронт их видел.
+ */
+function markAnomalies(offers, side) {
+    const priced = pricePool(offers, side);
+
+    for (const offer of offers) {
+        offer.anomaly = false;
+    }
+
+    // Пока предложений мало, кластер построить нельзя — ничего не режем.
+    if (priced.length < 3) {
+        return offers;
+    }
+
+    const total = priced.reduce(
+        (sum, offer) => sum + toNumber(offer.count),
+        0
+    );
+
+    if (total <= 0) {
+        return offers;
+    }
+
+    const byVolume = [...priced].sort(
+        (a, b) => toNumber(b.count) - toNumber(a.count)
+    );
+
+    const cluster = [];
+    let covered = 0;
+
+    for (const offer of byVolume) {
+        cluster.push(offer);
+
+        covered += toNumber(offer.count);
+
+        if (covered >= total * CLUSTER_COVERAGE) {
+            break;
+        }
+    }
+
+    const prices = cluster.map(offer => offerPrice(offer, side));
+
+    const bestClusterPrice = side === 'buy'
+        ? Math.max(...prices)
+        : Math.min(...prices);
+
+    const volumeLimit = median(cluster.map(o => toNumber(o.count))) *
+        ANOMALY_VOLUME_SHARE;
+
+    for (const offer of priced) {
+        if (cluster.includes(offer)) {
+            continue;
+        }
+
+        const price = offerPrice(offer, side);
+
+        const worseThanCluster = side === 'buy'
+            ? price > bestClusterPrice * (1 + ANOMALY_PRICE_GAP)
+            : price < bestClusterPrice * (1 - ANOMALY_PRICE_GAP);
+
+        offer.anomaly = worseThanCluster && toNumber(offer.count) < volumeLimit;
+    }
+
+    return offers;
+}
+
+/*
+ * Цена рынка без всплесков: лучшая среди чистых предложений, а если все
+ * оказались всплеском — прежний максимум/минимум.
+ */
+function cleanMarketPrice(offers, side) {
+    const values = pricePool(offers, side).map(
+        offer => offerPrice(offer, side)
+    );
+
+    if (!values.length) {
+        return 0;
+    }
+
+    const clean = pricePool(offers, side)
+        .filter(offer => !offer.anomaly)
+        .map(offer => offerPrice(offer, side));
+
+    const pool = clean.length ? clean : values;
+
+    return side === 'buy'
+        ? Math.max(...pool)
+        : Math.min(...pool);
+}
+
+/*
  * Запрашивает рынок товара: продавцов (show=sell, по возрастанию цены)
  * и покупателей (show=buy, по убыванию цены). Два запроса подряд с
  * паузой, чтобы не словить бан.
  */
 async function fetchMarket(externalId, server) {
+    const own = ownShopIds();
+
     const sellUrl = buildMarketUrl(externalId, 'sell', server);
 
     const sellHtml = await fetchHtml(sellUrl);
 
-    const sellOffers = parseMarketPage(sellHtml, sellUrl)
-        .filter(offer => offer.sellPrice > 0)
-        .sort((a, b) => a.sellPrice - b.sellPrice);
+    const sellOffers = markOwnOffers(
+        parseMarketPage(sellHtml, sellUrl).filter(offer => offer.sellPrice > 0),
+        own
+    );
+
+    markAnomalies(sellOffers, 'sell');
+
+    sellOffers.sort((a, b) => a.sellPrice - b.sellPrice);
 
     await sleep(1200);
 
@@ -42,9 +221,14 @@ async function fetchMarket(externalId, server) {
 
     const buyHtml = await fetchHtml(buyUrl);
 
-    const buyOffers = parseMarketPage(buyHtml, buyUrl)
-        .filter(offer => offer.buyPrice > 0)
-        .sort((a, b) => b.buyPrice - a.buyPrice);
+    const buyOffers = markOwnOffers(
+        parseMarketPage(buyHtml, buyUrl).filter(offer => offer.buyPrice > 0),
+        own
+    );
+
+    markAnomalies(buyOffers, 'buy');
+
+    buyOffers.sort((a, b) => b.buyPrice - a.buyPrice);
 
     const sample =
         sellOffers.find(o => o.name) ||
@@ -55,8 +239,8 @@ async function fetchMarket(externalId, server) {
         server: server || marketServer(),
         sellOffers,
         buyOffers,
-        marketSellPrice: sellOffers.length ? sellOffers[0].sellPrice : 0,
-        marketBuyPrice: buyOffers.length ? buyOffers[0].buyPrice : 0,
+        marketSellPrice: cleanMarketPrice(sellOffers, 'sell'),
+        marketBuyPrice: cleanMarketPrice(buyOffers, 'buy'),
         name: sample ? sample.name : '',
         image: sample ? sample.image : '',
         externalId: sample ? sample.externalId : String(externalId),
@@ -67,39 +251,29 @@ async function fetchMarket(externalId, server) {
 /*
  * Обновляет рыночные данные товара.
  *
- * Баг comeback: иногда отдаёт не всех продавцов, из-за чего цена
- * может резко измениться. Если отклонение от прошлой цены больше
- * порога — помечаем товар как подозрительный, НЕ перезаписываем
- * доверенную цену и просим очередь повторить обновление позже.
- *
- * Возвращает { requeue, deferMs, suspicious } для очереди.
+ * Рыночная цена — автоматическая: она пишется всегда и сразу, в том же
+ * задании очереди. Раньше при отклонении больше порога цена НЕ
+ * принималась, а товар уезжал в конец очереди на повтор: на длинной
+ * очереди это минуты ожидания, а при каждом новом «обновить цены всех»
+ * счётчик повторов обнулялся, и цифра не обновлялась вовсе. Порог
+ * отклонения оставлен только как пометка jump для глаза — беречь
+ * РУЧНЫЕ цены при переносе по-прежнему должен prices.js, а не сбор
+ * рынка.
  */
-async function updateProductMarket(product, job) {
-    const server = marketServer();
-
-    const market = await fetchMarket(product.externalId, server);
-
-    const retries = job ? toNumber(job.retries) : 0;
-    const maxRetries = job ? toNumber(job.maxRetries, 3) : 3;
+async function updateProductMarket(product) {
+    const market = await fetchMarket(
+        product.externalId,
+        marketServer()
+    );
 
     const threshold = toNumber(db.settings.priceDeviationThreshold, 0.3);
 
-    const previous =
-        product.market && toNumber(product.market.sellPrice) > 0
-            ? toNumber(product.market.sellPrice)
-            : 0;
+    const previous = product.market
+        ? toNumber(product.market.sellPrice)
+        : 0;
 
-    const incoming = market.marketSellPrice;
-
-    let suspicious = false;
-
-    if (previous > 0 && incoming > 0) {
-        const deviation = Math.abs(incoming - previous) / previous;
-
-        if (deviation > threshold) {
-            suspicious = true;
-        }
-    }
+    const incomingSell = toNumber(market.marketSellPrice);
+    const incoming = incomingSell || previous;
 
     // Подтягиваем имя/иконку для товаров, добавленных вручную по id.
     if (market.name && (!product.name || /^Товар\s/.test(product.name))) {
@@ -115,52 +289,48 @@ async function updateProductMarket(product, job) {
     product.market.server = market.server;
     product.market.sellOffers = market.sellOffers.slice(0, 12);
     product.market.buyOffers = market.buyOffers.slice(0, 12);
-    product.market.buyPrice = market.marketBuyPrice;
-    product.market.updatedAt = market.fetchedAt;
     product.market.sellOffersCount = market.sellOffers.length;
     product.market.buyOffersCount = market.buyOffers.length;
 
-    const canRetry = retries < Math.max(0, maxRetries - 1);
+    product.market.buyPrice = toNumber(market.marketBuyPrice) ||
+        toNumber(product.market.buyPrice);
 
-    if (suspicious && canRetry && incoming > 0) {
-        // Не доверяем резкой цене — оставляем прошлую, помечаем.
-        product.market.suspicious = true;
-        product.market.suspiciousSellPrice = incoming;
-        product.market.suspiciousAt = market.fetchedAt;
-        product.market.previousSellPrice = previous;
+    product.market.sellPrice = incoming;
+    product.market.updatedAt = market.fetchedAt;
+    product.market.previousSellPrice = previous;
 
-        if (!(toNumber(product.market.sellPrice) > 0)) {
-            product.market.sellPrice = previous;
-        }
+    const jumped =
+        previous > 0 &&
+        incoming > 0 &&
+        Math.abs(incoming - previous) / previous > threshold;
 
-        product.updatedAt = now();
-
-        save();
-
-        return {
-            requeue: true,
-            deferMs: Math.max(2000, toNumber(db.settings.updateIntervalMs, 7000)),
-            suspicious: true
+    if (jumped) {
+        product.market.jump = {
+            from: previous,
+            to: incoming,
+            at: market.fetchedAt
         };
+    } else {
+        delete product.market.jump;
     }
 
-    // Принимаем цену (обычное обновление или последняя попытка).
-    product.market.previousSellPrice = previous;
-    product.market.sellPrice = incoming || previous;
-    product.market.suspicious = false;
-    product.market.suspiciousSellPrice = null;
-    product.market.suspiciousAt = null;
+    // Старые поля suspicious больше не участвуют в логике обновления.
+    delete product.market.suspicious;
+    delete product.market.suspiciousSellPrice;
+    delete product.market.suspiciousAt;
 
     product.updatedAt = now();
 
     save();
 
-    return { requeue: false, suspicious: false };
+    return { jumped, sellPrice: incoming, buyPrice: product.market.buyPrice };
 }
 
 module.exports = {
     fetchMarket,
     updateProductMarket,
     buildMarketUrl,
-    marketServer
+    marketServer,
+    markAnomalies,
+    cleanMarketPrice
 };

@@ -28,11 +28,13 @@ const {
 const { makeSnapshot, dailySeries, sumDays } = require('./history');
 const { updateCat } = require('./update');
 const { updateProductMarket } = require('./market');
+const { applyMarketPricesToAll } = require('./prices');
 const {
     makeJob,
     enqueue,
     enqueueIfAbsent,
     cancel: cancelQueue,
+    pendingCount,
     status: queueStatus
 } = require('./queue');
 
@@ -95,10 +97,42 @@ function marketUpdateJob(productId, name) {
 
             job.name = product.name;
 
-            return await updateProductMarket(product, job);
-        },
-        { maxRetries: 3 }
+            return await updateProductMarket(product);
+        }
     );
+}
+
+/*
+ * Обновить рыночные цены всех товаров, которые стоят в этом коте.
+ * Товары берём из строк кота, порядок — как в таблице.
+ */
+function catProductPriceJob(catId, name) {
+    return makeJob('catPrices', catId, name || 'кот', async job => {
+        const cat = db.cats.find(c => c.id === job.refId);
+
+        if (!cat) {
+            return { error: 'Кот не найден' };
+        }
+
+        job.name = cat.name;
+
+        let queued = 0;
+
+        for (const item of cat.items) {
+            const product = findProductById(item.productId);
+
+            if (!product) {
+                continue;
+            }
+
+            // В начало не просим: пусть идут за текущими задачами.
+            enqueue(marketUpdateJob(product.id, product.name));
+
+            queued++;
+        }
+
+        return { ok: true, queued };
+    });
 }
 
 function buildCatResponse(cat) {
@@ -287,6 +321,64 @@ app.delete('/api/cats/:id', (req, res) => {
 });
 
 /*
+ * Настройка источника докупки у позиции кота.
+ *
+ *   null или { type: 'auto' }   — самый дешёвый источник (как считалось раньше)
+ *   { type: 'cat', catId }      — скуп конкретного кота, в том числе своего
+ *   { type: 'market' }          — быстрая покупка по цене продажи на рынке
+ *   { type: 'gold' }            — магазин за голду
+ *   { type: 'manual', price }   — цена вручную, price может быть пока 0
+ *
+ * Возвращает { source } либо { error }: кота с таким id быть не может, а
+ * незаполненная ручная цена остаётся настройкой "вручную" — расчёт в этот
+ * момент сам откатится на авто.
+ */
+function normalizeBuySource(value) {
+    if (value === null || value === undefined) {
+        return { source: null };
+    }
+
+    if (typeof value !== 'object') {
+        return { error: 'Источник докупки должен быть объектом' };
+    }
+
+    const type = cleanText(value.type);
+
+    if (!type || type === 'auto') {
+        return { source: null };
+    }
+
+    if (type === 'cat') {
+        const catId = cleanText(value.catId);
+
+        if (!findCat(catId)) {
+            return { error: 'Кот-источник не найден' };
+        }
+
+        return { source: { type: 'cat', catId } };
+    }
+
+    if (type === 'gold') {
+        return { source: { type: 'gold' } };
+    }
+
+    if (type === 'market') {
+        return { source: { type: 'market' } };
+    }
+
+    if (type === 'manual') {
+        return {
+            source: {
+                type: 'manual',
+                price: Math.max(0, toNumber(value.price))
+            }
+        };
+    }
+
+    return { error: 'Неизвестный тип источника докупки' };
+}
+
+/*
 |--------------------------------------------------------------------------
 | CAT ITEMS
 |--------------------------------------------------------------------------
@@ -313,6 +405,16 @@ app.put('/api/cats/:catId/items/:productId', (req, res) => {
 
     if (req.body.buyTarget !== undefined) {
         item.buyTarget = Math.max(0, toInt(req.body.buyTarget));
+    }
+
+    if (req.body.buySource !== undefined) {
+        const normalized = normalizeBuySource(req.body.buySource);
+
+        if (normalized.error) {
+            return res.status(400).json({ error: normalized.error });
+        }
+
+        item.buySource = normalized.source;
     }
 
     save();
@@ -425,6 +527,44 @@ app.post('/api/products/update-all-prices', (req, res) => {
 });
 
 /*
+ * Обновить рынок всех товаров и сразу перенести рыночные цены в ручные
+ * — и скупа, и продажи.
+ *
+ * Перенос встаёт в очередь последним заданием, поэтому считает по уже
+ * свежим ценам, а не по тем, что лежали до нажатия.
+ */
+app.post('/api/products/update-all-prices-carry', (req, res) => {
+    const products = [...db.products];
+
+    for (const product of products) {
+        enqueue(marketUpdateJob(product.id, product.name));
+    }
+
+    enqueue(makeJob(
+        'applyPricesAll',
+        'all',
+        'перенос цен',
+        () => {
+            /*
+             * Перенос обязан идти строго последним: задания рынка
+             * возвращаются в очередь на повтор, когда цена кажется
+             * подозрительной, и тогда перенос считал бы по устаревшим
+             * цифрам. Пока в очереди есть хоть одна задача — уступаем
+             * ей место и встаём в хвост.
+             */
+            if (pendingCount() > 0) {
+                return { requeue: true };
+            }
+
+            return applyMarketPricesToAll();
+        },
+        { maxRetries: 500 }
+    ));
+
+    res.json({ ok: true, queued: products.length + 1 });
+});
+
+/*
  * Перенести рыночную цену в ручную (sell или buy).
  */
 app.put('/api/products/:id/apply-market', (req, res) => {
@@ -498,6 +638,27 @@ app.post('/api/cats/update-all', (req, res) => {
     }
 
     res.json({ ok: true, queued: cats.length });
+});
+
+/*
+ * Обновить рыночные цены всех товаров этого кота. Сама задача встаёт в
+ * очередь как обычно, а уже из неё расставляет задания рынка по товарам
+ * — так интервал между запросами к comeback не ломается.
+ */
+app.post('/api/cats/:id/update-product-prices', (req, res) => {
+    const cat = findCat(req.params.id);
+
+    if (!cat) {
+        return res.status(404).json({ error: 'Кот не найден' });
+    }
+
+    if ((cat.items || []).length === 0) {
+        return res.status(400).json({ error: 'У кота нет товаров' });
+    }
+
+    enqueue(catProductPriceJob(cat.id, cat.name), frontOf(req));
+
+    res.json({ ok: true, queued: cat.items.length });
 });
 
 app.get('/api/queue', (req, res) => {

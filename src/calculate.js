@@ -5,7 +5,9 @@ const { toNumber } = require('./util');
 const {
     findProductById,
     getRecommendedPrice,
-    bestBuySource
+    bestBuySource,
+    shopUnitPrice,
+    quickBuyPrice
 } = require('./products');
 
 function getCatItem(cat, productId) {
@@ -28,6 +30,12 @@ function getOrCreateCatItem(cat, product) {
             sellPrice: 0,
             buyPrice: 0,
 
+            /*
+             * Откуда докупаем этот товар именно в этом коте. null значит
+             * "авто" — самый дешёвый источник, как считалось раньше.
+             */
+            buySource: null,
+
             lastSellUpdate: null,
             lastBuyUpdate: null
         };
@@ -36,6 +44,123 @@ function getOrCreateCatItem(cat, product) {
     }
 
     return item;
+}
+
+/*
+ * Цена и место докупки для одной позиции кота.
+ *
+ * item.buySource может закреплять источник:
+ *   { type: 'cat', catId }     — скуп конкретного кота (в том числе своего)
+ *   { type: 'market' }         — быстрая покупка: цена продажи товара на рынке
+ *   { type: 'gold' }           — магазин за голду
+ *   { type: 'manual', price }  — цена вручную
+ *   null или { type: 'auto' }  — самый дешёвый источник (bestBuySource)
+ *
+ * Если у закреплённого источника цены пока нет (скуп ещё не обновили,
+ * курс голды пустой, цена вручную не введена), откатываемся на авто:
+ * незаполненная настройка не должна обнулять расчёт.
+ */
+function resolveBuySource(product, cat, item) {
+    /*
+     * Откат на авто: подпись честно говорит, что закрепленное место
+     * цены не дало, иначе в строке было бы непонятно, почему выбран
+     * один кот, а считается по другому.
+     */
+    const auto = (note) => {
+        const source = bestBuySource(product, cat ? cat.id : undefined);
+
+        if (source && note) {
+            source.label += ' · ' + note;
+        }
+
+        return source;
+    };
+
+    const source = item && item.buySource;
+
+    if (!source || !source.type || source.type === 'auto') {
+        return auto();
+    }
+
+    if (source.type === 'manual') {
+        const price = toNumber(source.price);
+
+        if (price > 0) {
+            return {
+                type: 'manual',
+                label: 'Цена вручную',
+                price,
+                available: Infinity,
+                catId: null
+            };
+        }
+
+        return auto('цена не введена');
+    }
+
+    if (source.type === 'market') {
+        const price = quickBuyPrice(product);
+
+        if (price > 0) {
+            return {
+                type: 'market',
+                label: 'Быстрая покупка (рынок)',
+                price,
+                available: Infinity,
+                catId: null
+            };
+        }
+
+        return auto('рынок молчит');
+    }
+
+    if (source.type === 'gold') {
+        const price = shopUnitPrice(product);
+
+        if (price > 0) {
+            return {
+                type: 'gold',
+                label: 'Магазин (голда)',
+                price,
+                available: Infinity,
+                catId: null
+            };
+        }
+
+        return auto('голда не настроена');
+    }
+
+    if (source.type === 'cat') {
+        const target = db.cats.find(other => other.id === source.catId);
+
+        const targetItem = target
+            ? getCatItem(target, product.id)
+            : null;
+
+        const price = toNumber(targetItem && targetItem.buyPrice);
+
+        if (target && targetItem && price > 0) {
+            const label = cat && target.id === cat.id
+                ? 'Скуп (этот кот)'
+                : 'Скуп: ' + (target.name || target.shopName || 'Кот');
+
+            return {
+                type: 'cat',
+                label,
+                price,
+                available: toNumber(targetItem.buyCurrent),
+                catId: target.id
+            };
+        }
+
+        return auto(
+            target
+                ? 'у этого кота цены нет'
+                : 'кот-источник удалён'
+        );
+    }
+
+    return auto();
 }
 
 /*
@@ -54,7 +179,16 @@ function calculateItem(item, product, cat) {
     const bought = Math.max(0, buyTarget - buyCurrent);
 
     // сколько нужно докупить, чтобы вернуть запас к sellTarget
-    const needToBuy = Math.max(0, sellTarget - sellCurrent);
+    const needTotal = Math.max(0, sellTarget - sellCurrent);
+
+    /*
+     * Если товар стоит у кота и в скупе, и в продаже, купленное в
+     * собственном скупе уходит в тот же запас, докупать его снаружи не
+     * нужно. Без зачёта одна партия попадала и в bought, и в restockCost.
+     */
+    const coveredByBuy = Math.min(needTotal, bought);
+
+    const needToBuy = needTotal - coveredByBuy;
 
     const sellPrice =
         toNumber(item.sellPrice) ||
@@ -67,11 +201,8 @@ function calculateItem(item, product, cat) {
     const recommendedSell = getRecommendedPrice(product, 'sell');
     const recommendedBuy = getRecommendedPrice(product, 'buy');
 
-    // Где дешевле докупить: скуп (этот или другой кот) против голды.
-    const source = bestBuySource(
-        product,
-        cat ? cat.id : undefined
-    );
+    // Откуда докупаем: закрепленное место позиции или самый дешёвый источник.
+    const source = resolveBuySource(product, cat, item);
 
     const bestBuyPrice = source ? source.price : recommendedBuy;
 
@@ -84,7 +215,8 @@ function calculateItem(item, product, cat) {
     // Финансовая модель (в деньгах):
     //   выручка   = sold * фактическая цена продажи
     //   покупки   = bought * фактическая цена покупки
-    //   докупка   = needToBuy * цена лучшего источника
+    //   докупка   = needToBuy * цена источника докупки
+    //               (needToBuy уже за вычетом того, что кот купит сам)
     //   прибыль   = выручка - покупки - докупка
     const revenue = sold * sellPrice;
     const purchaseCost = bought * buyPrice;
@@ -109,10 +241,13 @@ function calculateItem(item, product, cat) {
         buyPrice,
         recommendedBuy,
 
+        needTotal,
+        coveredByBuy,
         needToBuy,
         bestBuyPrice,
         bestBuyLabel,
         bestBuyType: source ? source.type : 'none',
+        buySourceCatId: source ? source.catId : null,
 
         revenue,
         purchaseCost,
@@ -237,6 +372,7 @@ function sumStats(list) {
 module.exports = {
     getCatItem,
     getOrCreateCatItem,
+    resolveBuySource,
     calculateItem,
     calculateCatStats,
     calculateCatStatsDetailed,
